@@ -16,6 +16,10 @@
 
 #include "cpu/aarch64/acl_utils.hpp"
 
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+#include "cpu/aarch64/acl_threadpool_scheduler.hpp"
+#endif
+
 namespace dnnl {
 namespace impl {
 namespace cpu {
@@ -101,6 +105,7 @@ bool acl_act_ok(alg_kind_t eltwise_activation) {
             eltwise_logistic);
 }
 
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
 void acl_thread_bind() {
     static std::once_flag flag_once;
     // The threads in Compute Library are bound for the cores 0..max_threads-1
@@ -112,6 +117,34 @@ void acl_thread_bind() {
         arm_compute::Scheduler::get().set_num_threads(max_threads);
     });
 }
+#endif
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+void acl_set_custom_scheduler() {
+    static std::once_flag flag_once;
+    // Create threadpool scheduler
+    std::shared_ptr<IScheduler> threadpool_scheduler
+            = std::make_unique<ThreadpoolScheduler>();
+    // set CUSTOM scheduler in ACL
+    std::call_once(flag_once,
+            [&]() { arm_compute::Scheduler::set(threadpool_scheduler); });
+}
+
+void acl_set_threadpool_num_threads() {
+    using namespace dnnl::impl::threadpool_utils;
+    static std::once_flag flag_once;
+    threadpool_interop::threadpool_iface *tp = get_active_threadpool();
+    // Check active threadpool
+    bool is_main = get_active_threadpool() == tp;
+    if (is_main) {
+        // Set num threads based on threadpool size
+        const int num_threads = (tp) ? dnnl_get_max_threads() : 1;
+        std::call_once(flag_once, [&]() {
+            arm_compute::Scheduler::get().set_num_threads(num_threads);
+        });
+    }
+}
+#endif
 
 status_t tensor_info(arm_compute::TensorInfo &info, const memory_desc_t &md) {
     const memory_desc_wrapper md_wrap(&md);

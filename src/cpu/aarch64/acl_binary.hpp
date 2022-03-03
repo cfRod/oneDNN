@@ -124,7 +124,6 @@ struct acl_binary_t : public primitive_t {
         DECLARE_COMMON_PD_T("acl", acl_binary_t);
 
         status_t init(engine_t *engine) {
-
             using namespace acl_common_utils;
 
             // Only support f32 and s32 for now
@@ -185,9 +184,16 @@ struct acl_binary_t : public primitive_t {
                 return status::unimplemented;
             }
 
-            // Initialize the ACL threads
-            acl_thread_bind();
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
+            // Number of threads in Compute Library is set by OMP_NUM_THREADS
+            // dnnl_get_max_threads() == OMP_NUM_THREADS
+            acl_common_utils::acl_thread_bind();
+#endif
 
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+            // Set ACL scheduler for threadpool runtime
+            acl_common_utils::acl_set_custom_scheduler();
+#endif
             return status::success;
         }
 

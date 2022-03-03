@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Arm Ltd. and affiliates
+* Copyright 2021-2022 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -74,7 +74,6 @@ struct acl_inner_product_fwd_t : public primitive_t {
         DECLARE_COMMON_PD_T("inner_product:acl", acl_inner_product_fwd_t);
 
         status_t init(engine_t *engine) {
-            using namespace utils;
 
             const bool ok = is_fwd() && !has_zero_dim_memory()
                     && expect_data_types(data_type::f32, data_type::f32,
@@ -92,7 +91,16 @@ struct acl_inner_product_fwd_t : public primitive_t {
             // conf_status here can be either status::success or status::unimplemented
             if (conf_status != status::success) return conf_status;
 
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
+            // Number of threads in Compute Library is set by OMP_NUM_THREADS
+            // dnnl_get_max_threads() == OMP_NUM_THREADS
             acl_common_utils::acl_thread_bind();
+#endif
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+            // Set ACL scheduler for threadpool runtime
+            acl_common_utils::acl_set_custom_scheduler();
+#endif
 
             return status::success;
         }

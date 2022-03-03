@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Arm Ltd. and affiliates
+* Copyright 2021-2022 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,6 +26,13 @@ using namespace data_type;
 
 status_t acl_matmul_t::execute_forward(const exec_ctx_t &ctx) const {
 
+    std::lock_guard<std::mutex> _lock {this->mtx};
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+    acl_common_utils::acl_set_threadpool_num_threads();
+#endif
+
     status_t status = status::success;
     auto src_base = CTX_IN_MEM(const data_t *, DNNL_ARG_SRC);
     auto wei_base = CTX_IN_MEM(const data_t *, DNNL_ARG_WEIGHTS);
@@ -34,7 +41,6 @@ status_t acl_matmul_t::execute_forward(const exec_ctx_t &ctx) const {
     bool is_transA = pd()->amp_.is_transA;
     bool is_transB = pd()->amp_.is_transB;
 
-    std::lock_guard<std::mutex> _lock {this->mtx};
     auto *acl_resource = ctx.get_resource_mapper()->get<acl_resource_t>(this);
     acl_matmul_obj_t &acl_obj = acl_resource->get_acl_obj();
     // Run transpose kernel

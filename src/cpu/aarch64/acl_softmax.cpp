@@ -27,6 +27,11 @@ status_t acl_softmax_fwd_t::execute_forward(const exec_ctx_t &ctx) const {
     // concurrent multithreaded access.
     std::lock_guard<std::mutex> _lock {this->mtx};
 
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+    acl_common_utils::acl_set_threadpool_num_threads();
+#endif
+
     auto src = CTX_IN_MEM(const void *, DNNL_ARG_SRC);
     auto dst = CTX_OUT_MEM(void *, DNNL_ARG_DST);
 

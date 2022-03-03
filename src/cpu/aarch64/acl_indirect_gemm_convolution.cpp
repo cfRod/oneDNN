@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Arm Ltd. and affiliates
+* Copyright 2021-2022 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,6 +26,12 @@ status_t acl_indirect_gemm_convolution_fwd_t::execute_forward(
     // Lock here is needed because resource_mapper does not support
     // concurrent multithreaded access.
     std::lock_guard<std::mutex> _lock {this->mtx};
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+    acl_common_utils::acl_set_threadpool_num_threads();
+#endif
+
     // Retrieve primitive resource and configured Compute Library objects
     auto *acl_resource
             = ctx.get_resource_mapper()->get<acl_indirect_gemm_resource_t>(

@@ -44,7 +44,10 @@ arm_compute::DataType get_acl_data_t(const dnnl_data_type_t dt);
 arm_compute::ActivationLayerInfo get_acl_act(const primitive_attr_t &attr);
 arm_compute::ActivationLayerInfo get_acl_act(const eltwise_desc_t &ed);
 bool acl_act_ok(alg_kind_t eltwise_activation);
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
 void acl_thread_bind();
+#endif
 
 // Convert a memory desc to an arm_compute::TensorInfo. Note that memory desc
 // must be blocking format, plain, dense and have no zero dimensions.
@@ -67,6 +70,12 @@ status_t permute_common_dense_dimension_to_last(memory_desc_t *d0_permed,
         memory_desc_t *d1_permed, memory_desc_t *d2_permed,
         const memory_desc_t *d0, const memory_desc_t *d1,
         const memory_desc_t *d2);
+
+#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
+// Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+void acl_set_custom_scheduler();
+void acl_set_threadpool_num_threads();
+#endif
 
 #define MAYBE_REPORT_ACL_ERROR(msg) \
     do { \
