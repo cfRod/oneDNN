@@ -202,16 +202,6 @@ struct acl_softmax_fwd_t : public primitive_t {
                 return status::unimplemented;
             }
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
-            // Number of threads in Compute Library is set by OMP_NUM_THREADS
-            // dnnl_get_max_threads() == OMP_NUM_THREADS
-            acl_common_utils::acl_thread_bind();
-#endif
-
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-            // Set ACL scheduler for threadpool runtime
-            acl_common_utils::acl_set_custom_scheduler();
-#endif
             return status::success;
         }
 

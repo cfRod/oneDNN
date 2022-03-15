@@ -31,11 +31,6 @@ status_t acl_gemm_convolution_fwd_t<src_type, wei_type, dst_type,
     // concurrent multithreaded access.
     std::lock_guard<std::mutex> _lock {this->mtx};
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
-    acl_common_utils::acl_set_threadpool_num_threads();
-#endif
-
     // Retrieve primitive resource and configured Compute Library objects
     auto *acl_resource = ctx.get_resource_mapper()->get<acl_resource_t>(this);
     acl_obj_t<arm_compute::NEGEMMConvolutionLayer> &acl_obj

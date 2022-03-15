@@ -108,17 +108,6 @@ struct acl_wino_convolution_fwd_t : public primitive_t {
 
             set_default_alg_kind(alg_kind::convolution_winograd);
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_OMP
-            // Number of threads in Compute Library is set by OMP_NUM_THREADS
-            // dnnl_get_max_threads() == OMP_NUM_THREADS
-            acl_common_utils::acl_thread_bind();
-#endif
-
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-            // Set ACL scheduler for threadpool runtime
-            acl_common_utils::acl_set_custom_scheduler();
-#endif
-
             return status::success;
         }
 

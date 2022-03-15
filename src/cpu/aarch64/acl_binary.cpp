@@ -23,11 +23,6 @@ namespace aarch64 {
 
 status_t acl_binary_t::execute_forward(const exec_ctx_t &ctx) const {
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
-    acl_common_utils::acl_set_threadpool_num_threads();
-#endif
-
     auto src0 = CTX_IN_MEM(const void *, DNNL_ARG_SRC_0);
     auto src1 = CTX_IN_MEM(const void *, DNNL_ARG_SRC_1);
     auto dst = CTX_OUT_MEM(void *, DNNL_ARG_DST);

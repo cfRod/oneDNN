@@ -28,11 +28,6 @@ status_t acl_matmul_t::execute_forward(const exec_ctx_t &ctx) const {
 
     std::lock_guard<std::mutex> _lock {this->mtx};
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
-    acl_common_utils::acl_set_threadpool_num_threads();
-#endif
-
     status_t status = status::success;
     auto src_base = CTX_IN_MEM(const data_t *, DNNL_ARG_SRC);
     auto wei_base = CTX_IN_MEM(const data_t *, DNNL_ARG_WEIGHTS);

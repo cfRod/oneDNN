@@ -16,6 +16,8 @@
 #if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
 
 #include "cpu/aarch64/acl_threadpool_scheduler.hpp"
+#include "cpu/aarch64/acl_utils.hpp"
+
 #include "common/counting_barrier.hpp"
 #include "common/dnnl_thread.hpp"
 
@@ -40,19 +42,10 @@ namespace aarch64 {
 
 class ThreadFeeder {
 public:
-    /** Constructor
-     *
-     * @param[in] start First value that will be returned by the feeder
-     * @param[in] end   End condition (The last value returned by get_next() will be end - 1)
-     */
     explicit ThreadFeeder(unsigned int start = 0, unsigned int end = 0)
         : _atomic_counter(start), _end(end) {}
-    /** Function to check the next element in the range if there is one.
-     *
-     * @param[out] next Will contain the next element if there is one.
-     *
-     * @return False if the end of the range has been reached.
-     */
+
+    /// Function to check the next element in the range if there is one.
     bool get_next(unsigned int &next) {
         next = atomic_fetch_add_explicit(
                 &_atomic_counter, 1u, std::memory_order_relaxed);
@@ -90,17 +83,23 @@ void ThreadpoolScheduler::set_num_threads(unsigned int num_threads) {
 
 void ThreadpoolScheduler::schedule(ICPPKernel *kernel, const Hints &hints) {
     ITensorPack tensors;
+    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+    acl_common_utils::acl_set_threadpool_num_threads();
     schedule_common(kernel, hints, kernel->window(), tensors);
 }
 
 void ThreadpoolScheduler::schedule_op(ICPPKernel *kernel, const Hints &hints,
         const Window &window, ITensorPack &tensors) {
+    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
+    acl_common_utils::acl_set_threadpool_num_threads();
     schedule_common(kernel, hints, window, tensors);
 }
 
 void ThreadpoolScheduler::run_workloads(
         std::vector<arm_compute::IScheduler::Workload> &workloads) {
+
     arm_compute::lock_guard<std::mutex> lock(this->_run_workloads_mutex);
+
     const unsigned int num_threads
             = std::min(static_cast<unsigned int>(_num_threads),
                     static_cast<unsigned int>(workloads.size()));

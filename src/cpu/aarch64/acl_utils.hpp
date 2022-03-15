@@ -28,8 +28,6 @@
 #include "common/primitive.hpp"
 #include "common/utils.hpp"
 
-#include "cpu/cpu_engine.hpp"
-
 #include "arm_compute/runtime/NEON/NEFunctions.h"
 #include "arm_compute/runtime/Scheduler.h"
 

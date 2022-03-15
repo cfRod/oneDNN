@@ -32,11 +32,6 @@ status_t acl_eltwise_fwd_t<data_type>::execute_forward(
     // concurrent access.
     std::lock_guard<std::mutex> _lock {this->mtx};
 
-#if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    // Retrieve threadpool size during primitive execution and set ThreadpoolScheduler num_threads
-    acl_common_utils::acl_set_threadpool_num_threads();
-#endif
-
     status_t status = status::success;
     auto src_base = CTX_IN_MEM(const data_t *, DNNL_ARG_SRC);
     auto dst_base = CTX_OUT_MEM(data_t *, DNNL_ARG_DST);
