@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2021 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -32,8 +32,10 @@ int bench(int argc, char **argv) {
     }
 
     common();
+    res();
     conv();
     bnorm();
+    memory();
 
     return bs.tests == bs.passed ? OK : FAIL;
 }

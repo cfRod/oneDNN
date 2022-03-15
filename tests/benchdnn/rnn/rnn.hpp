@@ -28,8 +28,8 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_debug.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 #define AOC array_offset_calculator
 
@@ -55,7 +55,7 @@ dnnl_alg_kind_t activation2kind(activation_t alg);
 dnnl_rnn_direction_t str2direction(const char *str);
 const char *direction2str(dnnl_rnn_direction_t direction);
 
-enum data_kind_t {
+enum rnn_data_kind_t {
     SRC_LAYER,
     SRC_ITER,
     SRC_ITER_C,
@@ -90,8 +90,9 @@ enum data_kind_t {
     // AUGRU requires an addtional argument for attention.
     AUGRU_ATTENTION,
     DIFF_AUGRU_ATTENTION,
+    KIND_TOTAL,
 };
-const char *data_kind2str(data_kind_t kind);
+const char *rnn_data_kind2str(rnn_data_kind_t kind);
 
 // Gates indices
 enum {
@@ -112,6 +113,10 @@ enum dlc_type_t { CELL, PRIMITIVE };
 template <typename Telem>
 struct array_offset_calculator {
     array_offset_calculator() = default;
+
+    template <typename... Targs>
+    array_offset_calculator(const dnn_mem_t &mem, Targs... dims)
+        : base_ptr_((Telem *)mem), dims_({dims...}) {}
 
     template <typename... Targs>
     array_offset_calculator(Telem *base_ptr, Targs... dims)
@@ -170,7 +175,7 @@ struct desc_t {
     int64_t mb;
     int64_t n_layer;
     int64_t n_iter;
-    const char *name;
+    std::string name;
 };
 int str2desc(desc_t *desc, const char *str);
 std::ostream &operator<<(std::ostream &s, const desc_t &d);
@@ -199,7 +204,7 @@ struct dt_conf_t {
 
     dt_conf_t(const std::string &str) : str_(str) {}
 
-    virtual const entry_t &operator[](data_kind_t kind) const = 0;
+    virtual const entry_t &operator[](rnn_data_kind_t kind) const = 0;
 
     const std::string &str() const { return str_; }
     bool is_int8() const {
@@ -213,7 +218,7 @@ struct dt_conf_t {
     std::string str_;
 };
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -233,23 +238,17 @@ struct settings_t {
     std::vector<bool> trivial_strides {false};
     std::vector<bool> with_peephole {false};
     std::vector<bool> with_projection {false};
-    std::vector<int64_t> n_layer {0}, n_iter {0}, mb {0};
+    std::vector<int64_t> n_layer {0}, n_iter {0};
     std::vector<policy_t> scale_policy {policy_t::COMMON};
     std::vector<policy_t> scale_proj_policy {policy_t::COMMON};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
     unsigned int flags = 0x0;
     float alpha = 0.9f, beta = 0.0f;
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%prop%,%cfg%,%alg%,%activation%,%"
-              "direction%"
-              ","
-              "%DESC%,%Gops%,%Gfreq%,%-time%,%-Gflops%,%0time%,%0Gflops%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%Gops%,%Gfreq%,%-time%,%-"
-              "Gflops%,%0time%,%0Gflops%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args
+                = "%prop%,%cfg%,%alg%,%activation%,%direction%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -454,7 +453,7 @@ struct perf_report_t : public base_perf_report_t {
 
     double ops() const override { return p_->ops; }
     const int64_t *user_mb() const override { return &p_->user_mb; }
-    const char *name() const override { return p_->name; }
+    const std::string *name() const override { return &p_->name; }
     const dnnl_prop_kind_t *prop() const override { return &p_->prop; }
 
 private:
@@ -465,34 +464,15 @@ void prepare_ws_fwd(const prb_t &prb, std::vector<float> &ws_fwd_buffer,
         AOC<float> &ws_src_layer, AOC<float> &ws_src_iter,
         AOC<float> &ws_src_iter_c, AOC<float> &ws_gates, AOC<float> &ws_ht);
 
-void rnn_linear_fwd(const prb_t &prb, const float *src_layer_,
-        const float *src_layer_attention_, const float *src_iter_,
-        const float *src_iter_c_, const float *weights_layer_,
-        const float *weights_iter_, const float *weights_peephole_,
-        const float *weights_projection_, const float *bias_, float *dst_layer_,
-        float *dst_iter_, float *dst_iter_c_, const AOC<float> &ws_src_layer,
-        const AOC<float> &ws_src_iter, const AOC<float> &ws_src_iter_c,
-        const AOC<float> &ws_gates, const AOC<float> &ws_ht);
+void rnn_linear_fwd(const prb_t &prb, const args_t &args,
+        const AOC<float> &ws_src_layer, const AOC<float> &ws_src_iter,
+        const AOC<float> &ws_src_iter_c, const AOC<float> &ws_gates,
+        const AOC<float> &ws_ht);
 
-void compute_ref_fwd(const prb_t &prb, dnn_mem_t &src_layer_m,
-        dnn_mem_t &src_layer_attention_m, dnn_mem_t &src_iter_m,
-        dnn_mem_t &src_iter_c_m, dnn_mem_t &weights_layer_m,
-        dnn_mem_t &weights_iter_m, dnn_mem_t &weights_peephole_m,
-        dnn_mem_t &weights_projection_m, dnn_mem_t &bias_m,
-        dnn_mem_t &dst_layer_m, dnn_mem_t &dst_iter_m, dnn_mem_t &dst_iter_c_m);
-
-void compute_ref_bwd(const prb_t &prb, dnn_mem_t &src_layer_m,
-        dnn_mem_t &src_layer_attention_m, dnn_mem_t &src_iter_m,
-        dnn_mem_t &src_iter_c_m, dnn_mem_t &diff_dst_layer_m,
-        dnn_mem_t &diff_dst_iter_m, dnn_mem_t &diff_dst_iter_c_m,
-        dnn_mem_t &weights_layer_m, dnn_mem_t &weights_iter_m,
-        dnn_mem_t &weights_peephole_m, dnn_mem_t &weights_projection_m,
-        dnn_mem_t &bias_m, dnn_mem_t &dst_layer_m, dnn_mem_t &dst_iter_m,
-        dnn_mem_t &dst_iter_c_m, dnn_mem_t &diff_src_layer_m,
-        dnn_mem_t &diff_src_layer_attention_m, dnn_mem_t &diff_src_iter_m,
-        dnn_mem_t &diff_src_iter_c_m, dnn_mem_t &diff_weights_layer_m,
-        dnn_mem_t &diff_weights_iter_m, dnn_mem_t &diff_weights_peephole_m,
-        dnn_mem_t &diff_weights_projection_m, dnn_mem_t &diff_bias_m);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
+void compute_ref_fwd(const prb_t &prb, const args_t &args);
+void compute_ref_bwd(const prb_t &prb, const args_t &args);
 
 int doit(const prb_t &prb, res_t *res);
 int bench(int argc, char **argv);

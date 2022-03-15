@@ -14,6 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <utility>
+
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -21,12 +23,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-
-#include "norm.hpp"
 
 #include "binary/binary.hpp"
 #include "conv/deconv.hpp"
@@ -35,15 +35,9 @@ using namespace conv;
 
 namespace deconv {
 
-inline static void swap(int64_t &a, int64_t &b) {
-    int64_t temp = a;
-    a = b;
-    b = temp;
-}
-
 int transpose_data_wei(
         const prb_t *prb, const dnn_mem_t &wei, const dnn_mem_t &wei_tr) {
-    dnnl::impl::parallel_nd(prb->g, prb->oc / prb->g, prb->ic / prb->g, prb->kd,
+    benchdnn_parallel_nd(prb->g, prb->oc / prb->g, prb->ic / prb->g, prb->kd,
             prb->kh, prb->kw,
             [&](int64_t g, int64_t oc, int64_t ic, int64_t kd, int64_t kh,
                     int64_t kw) {
@@ -62,7 +56,6 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &dpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_deconvolution_desc_t cd;
-    dnnl_memory_desc_t src_d, wei_d, bia_d, dst_d;
 
     dnnl_dims_t src_1d_dims = {prb->mb, prb->ic, prb->iw};
     dnnl_dims_t src_2d_dims = {prb->mb, prb->ic, prb->ih, prb->iw};
@@ -91,16 +84,13 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
             ? dst_3d_dims
             : prb->ndims == 4 ? dst_2d_dims : dst_1d_dims;
 
-    SAFE(init_md(&src_d, prb->ndims, src_dims, prb->cfg[SRC].dt, prb->stag),
-            CRIT);
-    SAFE(init_md(&wei_d, prb->ndims + prb->has_groups, wei_dims,
-                 prb->cfg[WEI].dt, prb->wtag),
-            CRIT);
-    DNN_SAFE(dnnl_memory_desc_init_by_tag(&bia_d, 1, bia_dims, prb->cfg[BIA].dt,
-                     dnnl_format_tag_any),
-            WARN);
-    SAFE(init_md(&dst_d, prb->ndims, dst_dims, prb->cfg[DST].dt, prb->dtag),
-            CRIT);
+    auto src_d = dnn_mem_t::init_md(
+            prb->ndims, src_dims, prb->cfg[SRC].dt, prb->stag);
+    auto wei_d = dnn_mem_t::init_md(prb->ndims + prb->has_groups, wei_dims,
+            prb->cfg[WEI].dt, prb->wtag);
+    auto bia_d = dnn_mem_t::init_md(1, bia_dims, prb->cfg[BIA].dt, tag::any);
+    auto dst_d = dnn_mem_t::init_md(
+            prb->ndims, dst_dims, prb->cfg[DST].dt, prb->dtag);
 
     dnnl_dim_t strides_nd[] = {prb->sd, prb->sh, prb->sw};
     dnnl_dim_t dilates_nd[] = {prb->dd, prb->dh, prb->dw};
@@ -313,7 +303,7 @@ int doit(const prb_t *prb, res_t *res) {
     auto wei_tr_md = wei_md;
 
     const bool with_groups = true;
-    swap(wei_tr_md.dims[with_groups + 0], wei_tr_md.dims[with_groups + 1]);
+    std::swap(wei_tr_md.dims[with_groups + 0], wei_tr_md.dims[with_groups + 1]);
 
     const auto fp = dnnl_f32;
     const auto src_tag = tag::abx;
@@ -333,7 +323,7 @@ int doit(const prb_t *prb, res_t *res) {
     };
 
     const auto &test_engine = get_test_engine();
-    const auto &ref_engine = prim_ref ? get_cpu_engine() : get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
     dnn_mem_t src_dt(src_md, test_engine);
     dnn_mem_t wei_dt(wei_md, test_engine);
@@ -342,13 +332,13 @@ int doit(const prb_t *prb, res_t *res) {
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
     std::vector<dnn_mem_t> binary_po_fp, binary_po_dt;
     std::vector<int> binary_po_args;
-    SAFE(binary::setup_binary_po(const_pd, binary_po_args, binary_po_dt,
-                 binary_po_fp, ref_engine),
+    SAFE(binary::setup_binary_po(
+                 const_pd, binary_po_args, binary_po_dt, binary_po_fp),
             WARN);
     std::vector<dnn_mem_t> prelu_po_fp, prelu_po_dt;
     std::vector<int> prelu_po_args;
     SAFE(prelu::setup_prelu_po(
-                 const_pd, prelu_po_args, prelu_po_fp, prelu_po_dt, ref_engine),
+                 const_pd, prelu_po_args, prelu_po_fp, prelu_po_dt),
             WARN);
 
     dnn_mem_t src_fp(src_md, fp, src_tag, ref_engine);
@@ -375,14 +365,6 @@ int doit(const prb_t *prb, res_t *res) {
 
     args_t args, ref_args;
 
-    // Update prb descriptor to re-use convolution reference.
-    prb_t p_tr((desc_t)*prb, prb->dir, prb->cfg, prb->stag, prb->wtag,
-            prb->dtag, prb->alg, prb->attr, prb->mb, true);
-    swap(p_tr.ic, p_tr.oc);
-    swap(p_tr.ih, p_tr.oh);
-    swap(p_tr.id, p_tr.od);
-    swap(p_tr.iw, p_tr.ow);
-
     if (prb->dir & FLAG_FWD) {
         maybe_prepare_runtime_zero_points(src_zero_points_m, prb->attr,
                 DNNL_ARG_SRC, prb->ic, prb->src_zp);
@@ -399,7 +381,7 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zero_points_m);
         args.set(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, dst_zero_points_m);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_SRC, src_fp);
@@ -411,8 +393,8 @@ int doit(const prb_t *prb, res_t *res) {
             ref_args.set(binary_po_args, binary_po_fp);
             ref_args.set(prelu_po_args, prelu_po_fp);
 
-            TIME_REF(deconv::compute_ref_fwd(&p_tr, prim_ref, ref_args));
-            SAFE(compare_data(prb, DST, dst_dt, dst_fp, res), WARN);
+            check_correctness(
+                    prb, {DST}, args, ref_args, conv::setup_cmp, res, prim_ref);
         }
     } else if (prb->dir == BWD_D) {
         args.set(DNNL_ARG_DIFF_DST, dst_dt);
@@ -420,7 +402,7 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_DIFF_SRC, src_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_DIFF_SRC, src_fp);
@@ -429,8 +411,8 @@ int doit(const prb_t *prb, res_t *res) {
             ref_args.set(DNNL_ARG_DIFF_WEIGHTS, wei_tr_fp); // Hack. See ref.
             ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
 
-            TIME_REF(deconv::compute_ref_bwd_d(&p_tr, prim_ref, ref_args));
-            SAFE(compare_data(prb, SRC, src_dt, src_fp, res), WARN);
+            check_correctness(
+                    prb, {SRC}, args, ref_args, conv::setup_cmp, res, prim_ref);
         }
     } else if (prb->dir & FLAG_BWD && prb->dir & FLAG_WEI) {
         args.set(DNNL_ARG_SRC, src_dt);
@@ -439,7 +421,7 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_DIFF_BIAS, bia_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_SRC, src_fp);
@@ -449,10 +431,8 @@ int doit(const prb_t *prb, res_t *res) {
             ref_args.set(DNNL_ARG_DIFF_BIAS, bia_fp);
             ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
 
-            TIME_REF(deconv::compute_ref_bwd_w(&p_tr, prim_ref, ref_args));
-            SAFE(compare_data(&p_tr, WEI, wei_dt, wei_fp, res), WARN);
-            if (prb->dir & FLAG_BIA)
-                SAFE(compare_data(prb, BIA, bia_dt, bia_fp, res), WARN);
+            check_correctness(prb, {WEI, BIA}, args, ref_args, conv::setup_cmp,
+                    res, prim_ref);
         }
     } else {
         SAFE(FAIL, CRIT);

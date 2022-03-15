@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -35,7 +36,38 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
+
+dnn_mem_t::dnn_mem_t(const dnnl_memory_desc_t &md, dnnl_engine_t engine)
+    : dnn_mem_t(md, engine, handle_info_t::allocate()) {}
+dnn_mem_t::dnn_mem_t(const dnnl_memory_desc_t &md, dnnl_engine_t engine,
+        const handle_info_t &handle_info) {
+    active_ = (initialize(md, engine, handle_info) == OK);
+}
+
+dnn_mem_t::dnn_mem_t(
+        const dnnl_memory_desc_t &md, dnnl_data_type_t dt, dnnl_engine_t engine)
+    : dnn_mem_t(md, dt, std::string(tag::undef), engine) {}
+dnn_mem_t::dnn_mem_t(const dnnl_memory_desc_t &md, dnnl_data_type_t dt,
+        const std::string &tag, dnnl_engine_t engine) {
+    active_ = (initialize(md, dt, tag, engine) == OK);
+}
+
+dnn_mem_t::dnn_mem_t(int ndims, const dnnl_dims_t dims, dnnl_data_type_t dt,
+        const std::string &tag, dnnl_engine_t engine) {
+    active_ = (initialize(ndims, dims, dt, tag, engine) == OK);
+}
+
+dnn_mem_t::dnn_mem_t(int ndims, const dnnl_dims_t dims, dnnl_data_type_t dt,
+        const dnnl_dims_t strides, dnnl_engine_t engine) {
+    active_ = (initialize(ndims, dims, dt, strides, engine) == OK);
+}
+
+dnn_mem_t::dnn_mem_t(const dnn_mem_t &rhs, dnnl_data_type_t dt,
+        const std::string &tag, dnnl_engine_t engine)
+    : dnn_mem_t(rhs.md_, dt, tag, engine) {
+    if (active_) reorder(rhs);
+}
 
 int execute_reorder(const dnn_mem_t &src, dnn_mem_t &dst,
         const_dnnl_primitive_attr_t attr) {
@@ -111,6 +143,229 @@ int dnn_mem_t::reorder(const dnn_mem_t &rhs, const_dnnl_primitive_attr_t attr) {
     return execute_reorder(rhs, *this, attr);
 }
 
+size_t dnn_mem_t::size() const {
+    return dnnl_memory_desc_get_size(&md_);
+}
+
+size_t dnn_mem_t::sizeof_dt() const {
+    return dnnl_data_type_size(md_.data_type);
+}
+
+float dnn_mem_t::get_elem(int64_t idx) const {
+    void *data = (void *)*this;
+    float elem = 0.0;
+    switch (dt()) {
+        case dnnl_s8: elem = static_cast<int8_t *>(data)[idx]; break;
+        case dnnl_u8: elem = static_cast<uint8_t *>(data)[idx]; break;
+        case dnnl_s32: elem = static_cast<int32_t *>(data)[idx]; break;
+        case dnnl_f32: elem = static_cast<float *>(data)[idx]; break;
+        case dnnl_f16: elem = static_cast<float16_t *>(data)[idx]; break;
+        case dnnl_bf16: elem = static_cast<bfloat16_t *>(data)[idx]; break;
+        default: assert(!"bad data type");
+    }
+    return elem;
+}
+
+void dnn_mem_t::set_elem(int64_t idx, float value) const {
+    void *data = (void *)*this;
+    switch (dt()) {
+        case dnnl_s8: ((int8_t *)data)[idx] = value; break;
+        case dnnl_u8: ((uint8_t *)data)[idx] = value; break;
+        case dnnl_s32: ((int32_t *)data)[idx] = value; break;
+        case dnnl_f32: ((float *)data)[idx] = value; break;
+        case dnnl_f16: ((float16_t *)data)[idx] = value; break;
+        case dnnl_bf16: ((bfloat16_t *)data)[idx] = value; break;
+        default: assert(!"bad data type");
+    }
+}
+
+// Creates a memory object from the underlying buffer of an existing memory
+// object `mem`. The size of `mem` must not be less than the size of `md`.
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL || defined(DNNL_WITH_SYCL)
+static int init_memory(
+        dnnl_memory_t *ret, const dnnl_memory_desc_t &md, dnnl_memory_t mem) {
+    void *handle;
+    DNN_SAFE(dnnl_memory_get_data_handle(mem, &handle), CRIT);
+
+    dnnl_engine_t engine;
+    DNN_SAFE(dnnl_memory_get_engine(mem, &engine), CRIT);
+
+    bool is_sycl = is_sycl_engine(engine);
+    bool is_opencl = is_opencl_engine(engine);
+
+    *ret = nullptr;
+
+    if (is_opencl) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        dnnl_ocl_interop_memory_kind_t mem_kind;
+        DNN_SAFE(dnnl_ocl_interop_memory_get_memory_kind(mem, &mem_kind), CRIT);
+        DNN_SAFE(dnnl_ocl_interop_memory_create(
+                         ret, &md, engine, mem_kind, handle),
+                CRIT);
+#endif
+    } else if (is_sycl) {
+#ifdef DNNL_WITH_SYCL
+        dnnl_sycl_interop_memory_kind_t mem_kind;
+        DNN_SAFE(
+                dnnl_sycl_interop_memory_get_memory_kind(mem, &mem_kind), CRIT);
+        DNN_SAFE(dnnl_sycl_interop_memory_create(
+                         ret, &md, engine, mem_kind, handle),
+                CRIT);
+#endif
+    }
+
+    // Memory must be initialized at this point in some of the branches above.
+    if (!*ret) assert(!"not expected");
+
+    return OK;
+}
+#endif
+
+void dnn_mem_t::map() const {
+    assert(!is_mapped_ && "memory is already mapped");
+    is_mapped_ = true;
+
+    if (!m_) return;
+    auto mem = m_padded_ ? m_padded_ : m_;
+    DNN_SAFE_V(dnnl_memory_map_data(mem, &mapped_ptr_));
+}
+
+void dnn_mem_t::unmap() const {
+    assert(is_mapped_ && "memory is not mapped");
+    is_mapped_ = false;
+
+    if (!m_) return;
+    auto mem = m_padded_ ? m_padded_ : m_;
+    DNN_SAFE_V(dnnl_memory_unmap_data(mem, mapped_ptr_));
+    mapped_ptr_ = nullptr;
+}
+
+dnn_mem_t dnn_mem_t::create_from_host_ptr(
+        const dnnl_memory_desc_t &md, dnnl_engine_t engine, void *host_ptr) {
+    return dnn_mem_t(md, engine, {true, host_ptr});
+}
+
+size_t dnn_mem_t::pad_memory_size(
+        size_t sz, dnnl_engine_kind_t engine_kind, bool *was_padded) {
+    if (was_padded) *was_padded = false;
+    if (sz == 0 || !is_bench_mode(CORR) || engine_kind == dnnl_cpu) return 0;
+
+    const int pad_size = 4096;
+    if (was_padded) *was_padded = true;
+    return sz + pad_size;
+}
+
+dnnl_memory_desc_t dnn_mem_t::pad_memory_desc(const dnnl_memory_desc_t &md,
+        dnnl_engine_kind_t engine_kind, bool *was_padded) {
+    if (was_padded) *was_padded = false;
+    size_t old_sz = dnnl_memory_desc_get_size(&md);
+    if (old_sz == 0 || !is_bench_mode(CORR) || engine_kind == dnnl_cpu)
+        return md;
+
+    size_t sz = pad_memory_size(old_sz, engine_kind, was_padded);
+    if (sz == old_sz) return md;
+
+    dnnl_memory_desc_t ret;
+    dnnl_dims_t dims = {(dnnl_dim_t)sz};
+    DNN_SAFE_V(dnnl_memory_desc_init_by_tag(&ret, 1, dims, dnnl_u8, dnnl_x));
+    return ret;
+}
+
+dnnl_memory_desc_t dnn_mem_t::init_md(int ndims, const dnnl_dims_t dims,
+        dnnl_data_type_t data_type, const std::string &tag_,
+        const dims_t &strides_) {
+    dnnl_memory_desc_t md {};
+    const bool use_strides = !strides_.empty();
+    // Ignore tag_ in case strides_ are explicitly provided
+    if (use_strides) {
+        std::vector<dnnl_dim_t> strides(strides_);
+        DNN_SAFE_V(dnnl_memory_desc_init_by_strides(
+                &md, ndims, dims, data_type, strides.data()));
+        return md;
+    }
+
+    auto tag = normalize_tag(tag_, ndims);
+    if (tag == tag::undef || tag == tag::any || ndims == 0) {
+        dnnl_format_tag_t enum_tag = (tag == tag::undef || ndims == 0)
+                ? dnnl_format_tag_undef
+                : dnnl_format_tag_any;
+        DNN_SAFE_V(dnnl_memory_desc_init_by_tag(
+                &md, ndims, dims, data_type, enum_tag));
+        return md;
+    }
+
+    // Copy to temporary to handle dims == md->dims case.
+    dnnl_dims_t tmp_dims;
+    std::copy(dims, dims + ndims, tmp_dims);
+
+    md.ndims = ndims;
+    if (ndims < 0 || ndims > DNNL_MAX_NDIMS) SAFE_V(FAIL);
+
+    std::copy(tmp_dims, tmp_dims + ndims, md.dims);
+    md.data_type = data_type;
+    md.format_kind = dnnl_blocked;
+
+    // Parse dimensions and their block sizes starting from the innermost one.
+    std::vector<std::pair<int, int>> dim_blocks;
+    int pos = (int)tag.size() - 1;
+    int ndims_from_tag = -1;
+    while (pos >= 0) {
+        int pos0 = pos;
+
+        --pos;
+        while (pos >= 0 && std::isdigit(tag[pos]))
+            pos--;
+
+        int dim_idx = std::tolower(tag[pos0]) - 'a';
+        if (dim_idx >= ndims) SAFE_V(FAIL);
+        ndims_from_tag = MAX2(dim_idx + 1, ndims_from_tag);
+        int block_str_len = pos0 - pos - 1;
+        int block = (block_str_len == 0)
+                ? 1
+                : std::stoi(tag.substr(pos + 1, block_str_len));
+        dim_blocks.emplace_back(dim_idx, block);
+    }
+    if (ndims_from_tag != ndims) SAFE_V(FAIL);
+
+    auto &blk = md.format_desc.blocking;
+
+    // Compute strides and fill inner block sizes/indices.
+    dnnl_dim_t stride = 1;
+    dnnl_dims_t full_inner_blks;
+    std::fill(full_inner_blks, full_inner_blks + ndims, 1);
+    for (auto &p : dim_blocks) {
+        int dim_idx = p.first;
+        int block = p.second;
+        if (block == 1) {
+            assert(blk.strides[dim_idx] == 0);
+            blk.strides[dim_idx] = stride;
+
+            dnnl_dim_t fib = full_inner_blks[dim_idx];
+            dnnl_dim_t padded_dim = md.dims[dim_idx] == DNNL_RUNTIME_DIM_VAL
+                    ? DNNL_RUNTIME_DIM_VAL
+                    : (md.dims[dim_idx] + fib - 1) / fib * fib;
+            md.padded_dims[dim_idx] = padded_dim;
+            if (padded_dim == DNNL_RUNTIME_DIM_VAL)
+                stride = DNNL_RUNTIME_DIM_VAL;
+            else
+                stride *= (padded_dim / fib);
+        } else {
+            full_inner_blks[dim_idx] *= block;
+            blk.inner_blks[blk.inner_nblks] = block;
+            blk.inner_idxs[blk.inner_nblks] = dim_idx;
+            blk.inner_nblks++;
+            stride *= block;
+        }
+    }
+
+    // Inner block sizes/indices are stored from the outermost to the innermost
+    // so need to reverse them.
+    std::reverse(blk.inner_blks, blk.inner_blks + blk.inner_nblks);
+    std::reverse(blk.inner_idxs, blk.inner_idxs + blk.inner_nblks);
+
+    return md;
+}
+
 int dnn_mem_t::initialize_memory_create_sycl(const handle_info_t &handle_info) {
 #ifdef DNNL_WITH_SYCL
     if (handle_info.is_host_ptr) {
@@ -124,7 +379,8 @@ int dnn_mem_t::initialize_memory_create_sycl(const handle_info_t &handle_info) {
     switch (memory_kind) {
         case memory_kind_ext_t::usm:
         case memory_kind_ext_t::buffer: {
-            auto md_padded = pad_memory_desc(md_, &is_canary_protected_);
+            auto md_padded
+                    = pad_memory_desc(md_, engine_kind_, &is_canary_protected_);
             dnnl_sycl_interop_memory_kind_t mem_kind
                     = (memory_kind == memory_kind_ext_t::usm
                                     ? dnnl_sycl_interop_usm
@@ -139,8 +395,8 @@ int dnn_mem_t::initialize_memory_create_sycl(const handle_info_t &handle_info) {
         case memory_kind_ext_t::usm_shared: {
             SAFE(handle_info.is_allocate() ? OK : FAIL, CRIT);
             is_data_owner_ = true;
-            size_t sz = pad_memory_size(
-                    dnnl_memory_desc_get_size(&md_), &is_canary_protected_);
+            size_t sz = pad_memory_size(dnnl_memory_desc_get_size(&md_),
+                    engine_kind_, &is_canary_protected_);
             auto eng = dnnl::engine(engine_, true);
             auto dev = dnnl::sycl_interop::get_device(eng);
             auto ctx = dnnl::sycl_interop::get_context(eng);
@@ -180,7 +436,8 @@ int dnn_mem_t::initialize_memory_create_opencl(
     switch (memory_kind) {
         case memory_kind_ext_t::usm:
         case memory_kind_ext_t::buffer: {
-            auto md_padded = pad_memory_desc(md_, &is_canary_protected_);
+            auto md_padded
+                    = pad_memory_desc(md_, engine_kind_, &is_canary_protected_);
             dnnl_ocl_interop_memory_kind_t mem_kind
                     = (memory_kind == memory_kind_ext_t::usm
                                     ? dnnl_ocl_interop_usm
@@ -194,8 +451,8 @@ int dnn_mem_t::initialize_memory_create_opencl(
         case memory_kind_ext_t::usm_device:
         case memory_kind_ext_t::usm_shared: {
             is_data_owner_ = true;
-            size_t sz = pad_memory_size(
-                    dnnl_memory_desc_get_size(&md_), &is_canary_protected_);
+            size_t sz = pad_memory_size(dnnl_memory_desc_get_size(&md_),
+                    engine_kind_, &is_canary_protected_);
             if (memory_kind == memory_kind_ext_t::usm_device) {
                 data_ = dnnl::impl::gpu::ocl::usm::malloc_device(engine_, sz);
             } else {
@@ -246,14 +503,71 @@ int dnn_mem_t::initialize_memory_create(const handle_info_t &handle_info) {
     return OK;
 }
 
-int dnn_mem_t::cleanup_sycl() {
+int dnn_mem_t::initialize(const dnnl_memory_desc_t &md, dnnl_data_type_t dt,
+        const std::string &tag, dnnl_engine_t engine,
+        const handle_info_t &handle_info) {
+    is_mapped_ = false;
+
+    if (tag == tag::undef) {
+        md_ = md;
+        md_.data_type = dt;
+    } else {
+        md_ = dnn_mem_t::init_md(md.ndims, md.dims, dt, tag);
+    }
+    engine_ = engine;
+    DNN_SAFE(dnnl_engine_get_kind(engine_, &engine_kind_), CRIT);
+
+    SAFE(initialize_memory_create(handle_info), CRIT);
+
+    size_t sz = dnnl_memory_desc_get_size(&md_);
+    if (is_canary_protected_) sz = pad_memory_size(sz, engine_kind_);
+
+    // Do not fill a memory if its size is zero. Moreover, memset expects
+    // defined pointer, nullptr is not allowed.
+    if (sz != 0 && handle_info.is_allocate()) {
+        // Fill memory with a magic number (NAN for fp data types) to catch
+        // possible uninitialized access.
+        map();
+        memset(mapped_ptr_, dnnl_mem_default_value, sz);
+        unmap();
+    }
+
+    // Keep memory mapped and unmap only before execution
+    map();
+
+    return OK;
+}
+
+int dnn_mem_t::initialize(const dnnl_memory_desc_t &md, dnnl_engine_t engine,
+        const handle_info_t &handle_info) {
+    return initialize(md, md.data_type, tag::undef, engine, handle_info);
+}
+
+int dnn_mem_t::initialize(int ndims, const dnnl_dims_t dims,
+        dnnl_data_type_t dt, const std::string &tag, dnnl_engine_t engine) {
+    dnnl_memory_desc_t xmd;
+    xmd = dnn_mem_t::init_md(ndims, dims, dt, tag);
+    SAFE(initialize(xmd, engine), CRIT);
+    return OK;
+}
+
+int dnn_mem_t::initialize(int ndims, const dnnl_dims_t dims,
+        dnnl_data_type_t dt, const dnnl_dims_t strides, dnnl_engine_t engine) {
+    dnnl_memory_desc_t xmd;
+    DNN_SAFE(dnnl_memory_desc_init_by_strides(&xmd, ndims, dims, dt, strides),
+            CRIT);
+    SAFE(initialize(xmd, engine), CRIT);
+    return OK;
+}
+
+static int cleanup_sycl(const dnnl_engine_t &engine, void *data) {
 #ifdef DNNL_WITH_SYCL
     switch (memory_kind) {
         case memory_kind_ext_t::usm_device:
         case memory_kind_ext_t::usm_shared: {
-            auto eng = dnnl::engine(engine_, true);
+            auto eng = dnnl::engine(engine, true);
             auto ctx = dnnl::sycl_interop::get_context(eng);
-            ::sycl::free(data_, ctx);
+            ::sycl::free(data, ctx);
             break;
         }
         default: break;
@@ -262,12 +576,12 @@ int dnn_mem_t::cleanup_sycl() {
     return OK;
 }
 
-int dnn_mem_t::cleanup_opencl() {
+static int cleanup_opencl(const dnnl_engine_t &engine, void *data) {
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
     switch (memory_kind) {
         case memory_kind_ext_t::usm_device:
         case memory_kind_ext_t::usm_shared:
-            dnnl::impl::gpu::ocl::usm::free(engine_, data_);
+            dnnl::impl::gpu::ocl::usm::free(engine, data);
             break;
         default: break;
     }
@@ -275,82 +589,21 @@ int dnn_mem_t::cleanup_opencl() {
     return OK;
 }
 
-dnn_mem_t dnn_mem_t::create_from_host_ptr(
-        const dnnl_memory_desc_t &md, dnnl_engine_t engine, void *host_ptr) {
-    return dnn_mem_t(md, engine, {true, host_ptr});
-}
-
-int dnn_mem_t::init_memory(
-        dnnl_memory_t *ret, const dnnl_memory_desc_t &md, dnnl_memory_t mem) {
-    void *handle;
-    DNN_SAFE(dnnl_memory_get_data_handle(mem, &handle), CRIT);
-
-    dnnl_engine_t engine;
-    DNN_SAFE(dnnl_memory_get_engine(mem, &engine), CRIT);
-
-    bool is_sycl = is_sycl_engine(engine);
-    bool is_opencl = is_opencl_engine(engine);
-
-    *ret = nullptr;
-
-    if (is_opencl) {
-#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
-        dnnl_ocl_interop_memory_kind_t mem_kind;
-        DNN_SAFE(dnnl_ocl_interop_memory_get_memory_kind(mem, &mem_kind), CRIT);
-        DNN_SAFE(dnnl_ocl_interop_memory_create(
-                         ret, &md, engine, mem_kind, handle),
-                CRIT);
-#endif
-    } else if (is_sycl) {
-#ifdef DNNL_WITH_SYCL
-        dnnl_sycl_interop_memory_kind_t mem_kind;
-        DNN_SAFE(
-                dnnl_sycl_interop_memory_get_memory_kind(mem, &mem_kind), CRIT);
-        DNN_SAFE(dnnl_sycl_interop_memory_create(
-                         ret, &md, engine, mem_kind, handle),
-                CRIT);
-#endif
-    }
-
-    // Memory must be initialized at this point in some of the branches above.
-    if (!*ret) assert(!"not expected");
-
-    return OK;
-}
-
-// Returns physical offset by logical one. Logical offset is represented by an
-// array pos. If is_pos_padded is true pos represents the position in already
-// padded area.
-dnnl_dim_t md_off_v(const dnnl_memory_desc_t &md, const dnnl_dims_t pos,
-        bool is_pos_padded) {
-    assert(md.format_kind == dnnl_blocked);
-    const auto &blk = md.format_desc.blocking;
-
-    dnnl_dims_t pos_copy = {0};
-    for (int d = 0; d < md.ndims; ++d)
-        pos_copy[d] = pos[d] + (is_pos_padded ? 0 : md.padded_offsets[d]);
-
-    dnnl_dim_t phys_offset = md.offset0;
-
-    if (blk.inner_nblks > 0) {
-        dnnl_dim_t blk_stride = 1;
-        for (int iblk = blk.inner_nblks - 1; iblk >= 0; --iblk) {
-            const int d = blk.inner_idxs[iblk];
-
-            dnnl_dim_t p = pos_copy[d] % blk.inner_blks[iblk];
-            pos_copy[d] /= blk.inner_blks[iblk];
-
-            phys_offset += p * blk_stride;
-            blk_stride *= blk.inner_blks[iblk];
+int dnn_mem_t::cleanup() {
+    if (!active_) return OK;
+    unmap();
+    DNN_SAFE(dnnl_memory_destroy(m_), CRIT);
+    if (is_data_owner_) {
+        if (is_sycl_engine(engine_)) {
+            SAFE(cleanup_sycl(engine_, data_), CRIT);
+        } else if (is_opencl_engine(engine_)) {
+            SAFE(cleanup_opencl(engine_, data_), CRIT);
+        } else {
+            zfree(data_);
         }
     }
-
-    for (int d = 0; d < md.ndims; ++d) {
-        const dnnl_dim_t p = pos_copy[d];
-        phys_offset += p * blk.strides[d];
-    }
-
-    return phys_offset;
+    DNN_SAFE(dnnl_memory_destroy(m_padded_), CRIT);
+    return OK;
 }
 
 // Returns physical offset by logical one. logical offset is represented by a
@@ -371,7 +624,8 @@ static dnnl_dim_t md_off_l(dnnl_dims_t _pos, const dnnl_memory_desc_t &md,
 }
 
 template <typename T>
-int check_zero_padding_impl(const dnn_mem_t &mem, int arg, int *error_count) {
+static int check_zero_padding_impl(
+        const dnn_mem_t &mem, int arg, res_t *res, int *error_count) {
     const int ndims = mem.ndims();
     const auto *dims = mem.md_.dims;
     const auto *pdims = mem.md_.padded_dims;
@@ -395,7 +649,7 @@ int check_zero_padding_impl(const dnn_mem_t &mem, int arg, int *error_count) {
         auto dim_l = product(pdims, pdims + dim_m_idx);
         auto dim_r = product(pdims + dim_m_idx + 1, pdims + ndims);
 
-        dnnl::impl::parallel_nd(dim_l, dim_r, [&](dnnl_dim_t l, dnnl_dim_t r) {
+        benchdnn_parallel_nd(dim_l, dim_r, [&](dnnl_dim_t l, dnnl_dim_t r) {
             for (dnnl_dim_t m = dims[dim_m_idx]; m < pdims[dim_m_idx]; ++m) {
                 auto l_idx = (l * pdims[dim_m_idx] + m) * dim_r + r;
                 auto idx = md_off_l(nullptr, mem.md_, l_idx, true);
@@ -432,6 +686,7 @@ int check_zero_padding_impl(const dnn_mem_t &mem, int arg, int *error_count) {
 
     if (!ok) {
         BENCHDNN_PRINT(0, "@@@ [arg:%d] check_zero_padding failed\n", arg);
+        if (res) res->state = FAILED;
     }
 
     if (error_count != nullptr) *error_count = errors;
@@ -439,9 +694,10 @@ int check_zero_padding_impl(const dnn_mem_t &mem, int arg, int *error_count) {
     return ok ? OK : FAIL;
 }
 
-int check_zero_padding(const dnn_mem_t &mem, int arg, int *error_count) {
+int check_zero_padding(
+        const dnn_mem_t &mem, int arg, res_t *res, int *error_count) {
 #define CASE(dt, type) \
-    case dt: return check_zero_padding_impl<type>(mem, arg, error_count);
+    case dt: return check_zero_padding_impl<type>(mem, arg, res, error_count);
 
     switch (mem.md_.data_type) {
         case dnnl_data_type_undef:
@@ -461,11 +717,11 @@ int check_zero_padding(const dnn_mem_t &mem, int arg, int *error_count) {
     return FAIL;
 }
 
-int check_buffer_overwrite(const dnn_mem_t &mem, int arg) {
+int check_buffer_overwrite(const dnn_mem_t &mem, int arg, res_t *res) {
     if (!mem.is_canary_protected()) return OK;
 
     size_t sz = mem.size();
-    size_t sz_padded = dnn_mem_t::pad_memory_size(sz);
+    size_t sz_padded = dnn_mem_t::pad_memory_size(sz, mem.engine_kind());
 
     auto *mem_ptr = (const uint8_t *)mem;
     for (size_t i = sz; i < sz_padded; i++) {
@@ -475,7 +731,43 @@ int check_buffer_overwrite(const dnn_mem_t &mem, int arg) {
                 "@@@ [arg:%d] check_buffer_overwrite failed. Expected: %d at "
                 "byte: %lld but found: %d\n",
                 arg, dnnl_mem_default_value, (long long)i, mem_ptr[i]);
+        if (res) res->state = FAILED;
         return FAIL;
     }
     return OK;
+}
+
+// Returns physical offset by logical one. Logical offset is represented by an
+// array pos. If is_pos_padded is true pos represents the position in already
+// padded area.
+dnnl_dim_t md_off_v(const dnnl_memory_desc_t &md, const dnnl_dims_t pos,
+        bool is_pos_padded) {
+    assert(md.format_kind == dnnl_blocked);
+    const auto &blk = md.format_desc.blocking;
+
+    dnnl_dims_t pos_copy = {0};
+    for (int d = 0; d < md.ndims; ++d)
+        pos_copy[d] = pos[d] + (is_pos_padded ? 0 : md.padded_offsets[d]);
+
+    dnnl_dim_t phys_offset = md.offset0;
+
+    if (blk.inner_nblks > 0) {
+        dnnl_dim_t blk_stride = 1;
+        for (int iblk = blk.inner_nblks - 1; iblk >= 0; --iblk) {
+            const int d = blk.inner_idxs[iblk];
+
+            dnnl_dim_t p = pos_copy[d] % blk.inner_blks[iblk];
+            pos_copy[d] /= blk.inner_blks[iblk];
+
+            phys_offset += p * blk_stride;
+            blk_stride *= blk.inner_blks[iblk];
+        }
+    }
+
+    for (int d = 0; d < md.ndims; ++d) {
+        const dnnl_dim_t p = pos_copy[d];
+        phys_offset += p * blk.strides[d];
+    }
+
+    return phys_offset;
 }

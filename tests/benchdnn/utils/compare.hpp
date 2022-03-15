@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ struct compare_t {
     struct driver_check_func_args_t {
         driver_check_func_args_t(const dnn_mem_t &exp_mem,
                 const dnn_mem_t &got_f32, const int64_t i,
-                const dnnl_data_type_t data_type);
+                const dnnl_data_type_t data_type, const float trh);
 
         const dnnl_data_type_t dt = dnnl_data_type_undef;
         const int64_t idx = 0;
@@ -39,10 +39,12 @@ struct compare_t {
         const float got = 0.f;
         const float diff = 0.f;
         const float rel_diff = 0.f;
+        const float trh = 0.f;
     };
 
     compare_t() = default;
 
+    void set_norm_validation_mode(bool un) { use_norm_ = un; }
     void set_threshold(float trh) { trh_ = trh; }
     void set_zero_trust_percent(float ztp) { zero_trust_percent_ = ztp; }
     void set_data_kind(data_kind_t dk) { kind_ = dk; }
@@ -60,10 +62,11 @@ struct compare_t {
     }
 
     int compare(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
-            const attr_t &attr, res_t *res,
-            const dnnl_engine_t &engine = get_test_engine()) const;
+            const attr_t &attr, res_t *res) const;
 
 private:
+    // Switch between point-to-point and norm comparison.
+    bool use_norm_ = false;
     // Threshold for a point-to-point comparison.
     float trh_ = 0.f;
     // The default percent value of zeros allowed in the output.
@@ -73,6 +76,12 @@ private:
     // Driver-specific function that adds additional criteria for a test case to
     // pass.
     driver_check_func_t driver_check_func_;
+
+    // Internal validation methods under `compare` interface.
+    int compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
+            const attr_t &attr, res_t *res) const;
+    int compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
+            const attr_t &attr, res_t *res) const;
 };
 
 } // namespace compare

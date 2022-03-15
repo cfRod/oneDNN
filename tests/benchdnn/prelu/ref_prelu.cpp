@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,90 +14,112 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <algorithm>
+
 #include <assert.h>
 
-#include <algorithm>
 #include "prelu/prelu.hpp"
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 namespace prelu {
 
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &weights, dnn_mem_t &dst) {
-    const float *src_ptr = (const float *)src;
-    const float *wei_ptr = (const float *)weights;
+void compute_ref_fwd(const prb_t *prb, const args_t &args) {
+    const dnn_mem_t &src = args.find(DNNL_ARG_SRC);
+    const dnn_mem_t &wei = args.find(DNNL_ARG_WEIGHTS);
+    const dnn_mem_t &dst = args.find(DNNL_ARG_DST);
+
     float *dst_ptr = (float *)dst;
 
     const auto nelems = src.nelems();
     const auto weights_broadcast_mask = prb->get_broadcast_mask();
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const auto wei_idx = src.get_scale_idx(i, weights_broadcast_mask);
-        float res = src_ptr[i] * (src_ptr[i] > 0 ? 1.f : wei_ptr[wei_idx]);
+        const float s = src.get_elem(i);
+        float res = s * (s > 0 ? 1.f : wei.get_elem(wei_idx));
         maybe_saturate(prb->sdt[0], res);
         dst_ptr[i] = res;
     });
 }
 
-void compute_ref_bwd(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &weights, dnn_mem_t &diff_src,
-        const dnn_mem_t &diff_dst, dnn_mem_t &diff_weights) {
-    const float *src_ptr = (const float *)src;
-    const float *wei_ptr = (const float *)weights;
-    const float *diff_dst_ptr = (const float *)diff_dst;
-    float *diff_src_ptr = (float *)diff_src;
-    float *diff_wei_ptr = (float *)diff_weights;
+void compute_ref_bwd(const prb_t *prb, const args_t &args) {
+    const dnn_mem_t &src = args.find(DNNL_ARG_SRC);
+    const dnn_mem_t &wei = args.find(DNNL_ARG_WEIGHTS);
+    const dnn_mem_t &d_dst = args.find(DNNL_ARG_DIFF_DST);
+    const dnn_mem_t &d_src = args.find(DNNL_ARG_DIFF_SRC);
+    const dnn_mem_t &d_wei = args.find(DNNL_ARG_DIFF_WEIGHTS);
 
-    const auto src_nelems = diff_src.nelems();
-    const auto wei_nelems = diff_weights.nelems();
-    float *diff_wei_buf = diff_wei_ptr;
+    float *d_src_ptr = (float *)d_src;
+    float *d_wei_ptr = (float *)d_wei;
+    float *d_wei_buf = d_wei_ptr;
+
+    const auto src_nelems = d_src.nelems();
+    const auto wei_nelems = d_wei.nelems();
 
     const auto ker = [&](int64_t i, int64_t wei_idx, int64_t d_wei_idx) {
-        float d_src
-                = diff_dst_ptr[i] * (src_ptr[i] > 0 ? 1.f : wei_ptr[wei_idx]);
+        float s = src.get_elem(i);
+        float dd = d_dst.get_elem(i);
+        float d_src = dd * (s > 0 ? 1.f : wei.get_elem(wei_idx));
         maybe_saturate(prb->sdt[0], d_src);
-        diff_src_ptr[i] = d_src;
-        diff_wei_buf[d_wei_idx] += MIN2(0.f, src_ptr[i]) * diff_dst_ptr[i];
+        d_src_ptr[i] = d_src;
+        d_wei_buf[d_wei_idx] += MIN2(0.f, s) * dd;
     };
 
-    dnnl::impl::parallel_nd(
-            wei_nelems, [&](int64_t i) { diff_wei_ptr[i] = 0; });
+    benchdnn_parallel_nd(wei_nelems, [&](int64_t i) { d_wei_ptr[i] = 0; });
 
     if (wei_nelems == 1) {
-        const auto num_thr = MIN2(
-                static_cast<int64_t>(dnnl_get_max_threads()), src_nelems);
-        diff_wei_buf = new float[num_thr];
-        dnnl::impl::parallel(num_thr, [&](const int ithr, const int nthr) {
-            int64_t start {0}, end {0};
-            dnnl::impl::balance211(src_nelems, nthr, ithr, start, end);
-            diff_wei_buf[ithr] = 0;
+        const int reduce_dim = 0;
+        const int64_t N = d_src.md_.dims[reduce_dim];
+        const int64_t nelems_per_thr = src_nelems / N;
+        d_wei_buf = new float[N];
+        benchdnn_parallel_nd(N, [&](int64_t n) {
+            d_wei_buf[n] = 0;
 
-            for (int64_t i = start; i < end; ++i)
-                ker(i, 0, ithr);
+            for (int64_t ithr_i = 0; ithr_i < nelems_per_thr; ++ithr_i) {
+                int64_t idx = nelems_per_thr * n + ithr_i;
+                ker(idx, 0, n);
+            }
         });
 
-        for (int64_t i = 0; i < num_thr; i++)
-            diff_wei_ptr[0] += diff_wei_buf[i];
-        delete[] diff_wei_buf;
+        for (int64_t i = 0; i < N; i++)
+            d_wei_ptr[0] += d_wei_buf[i];
+        delete[] d_wei_buf;
 
     } else if (src_nelems == wei_nelems) {
-        dnnl::impl::parallel_nd(src_nelems, [&](int64_t i) { ker(i, i, i); });
+        benchdnn_parallel_nd(src_nelems, [&](int64_t i) { ker(i, i, i); });
     } else {
-        const auto weights_broadcast_mask = prb->get_broadcast_mask();
+        const int64_t reduce_size = src_nelems / wei_nelems;
 
-        dnnl::impl::parallel(0, [&](const int ithr, const int nthr) {
-            int64_t start {0}, end {0};
-            dnnl::impl::balance211(wei_nelems, nthr, ithr, start, end);
-            if (start == end) return;
+        // Re-used from ref_reduction.cpp
+        // TODO: make a common reduction kernel to avoid duplication.
+        const auto &src_dims = prb->vdims[0];
+        const auto &wei_dims = prb->vdims[1];
+        dims_t reduce_dims(prb->ndims, 1);
+        for (int d = 0; d < prb->ndims; ++d)
+            if (src_dims[d] != wei_dims[d]) reduce_dims[d] = src_dims[d];
 
-            for (int64_t i = 0; i < src_nelems; ++i) {
-                const auto wei_idx
-                        = diff_src.get_scale_idx(i, weights_broadcast_mask);
-                if (wei_idx < start || wei_idx >= end) continue;
-                ker(i, wei_idx, wei_idx);
+        benchdnn_parallel_nd(wei_nelems, [&](int64_t f) {
+            dims_t wei_pos = off2dims_idx(wei_dims, f);
+            const int64_t wei_off = md_off_v(wei.md_, wei_pos.data());
+            const int64_t src_wei_off = md_off_v(src.md_, wei_pos.data());
+
+            for (int64_t r = 0; r < reduce_size; ++r) {
+                dims_t reduce_pos = off2dims_idx(reduce_dims, r);
+                const int64_t src_reduce_off
+                        = md_off_v(src.md_, reduce_pos.data());
+                const int64_t src_off = src_wei_off + src_reduce_off;
+                ker(src_off, wei_off, wei_off);
             }
         });
     }
+}
+
+void compute_ref(
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
+    if (prb->dir & FLAG_FWD)
+        compute_ref_fwd(prb, args);
+    else
+        compute_ref_bwd(prb, args);
 }
 
 } // namespace prelu

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,12 +24,12 @@
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace concat {
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -43,15 +43,11 @@ struct settings_t {
     std::vector<std::vector<std::string>> stag {{tag::abx}};
     std::vector<std::string> dtag {tag::undef};
     std::vector<int> axis {1};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%sdt%,%ddt%,%stag%,%dtag%,%axis%,%DESC%,%-"
-              "time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%sdt%,%ddt%,%stag%,%dtag%,%axis%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -103,6 +99,7 @@ struct perf_report_t : public base_perf_report_t {
 
     void dump_desc_csv(std::ostream &s) const override { dump_desc(s); }
 
+    const std::string *name() const override { return &p_->name; }
     const int *axis() const override { return &p_->axis; }
     const std::vector<dnnl_data_type_t> *sdt() const override { return &sdt_; }
     const dnnl_data_type_t *ddt() const override { return &p_->ddt; }
@@ -116,8 +113,8 @@ private:
     std::string dtag_;
 };
 
-void compute_ref(
-        const prb_t *prb, const std::vector<dnn_mem_t> &src, dnn_mem_t &dst);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);

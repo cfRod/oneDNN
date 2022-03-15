@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &cpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_convolution_desc_t cd;
-    dnnl_memory_desc_t src_d, wei_d, bia_d, dst_d;
 
     dnnl_dims_t src_1d_dims = {prb->mb, prb->ic, prb->iw};
     dnnl_dims_t src_2d_dims = {prb->mb, prb->ic, prb->ih, prb->iw};
@@ -72,15 +71,11 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
     std::string bia_tag = tag::any;
     std::string dst_tag = prb->dtag;
 
-    SAFE(init_md(&src_d, prb->ndims, src_dims, src_dt, prb->stag), WARN);
-
-    SAFE(init_md(&wei_d, prb->ndims + prb->has_groups, wei_dims, wei_dt,
-                 prb->wtag),
-            WARN);
-
-    SAFE(init_md(&bia_d, 1, bia_dims, bia_dt, bia_tag), WARN);
-
-    SAFE(init_md(&dst_d, prb->ndims, dst_dims, dst_dt, dst_tag), WARN);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, src_dims, src_dt, prb->stag);
+    auto wei_d = dnn_mem_t::init_md(
+            prb->ndims + prb->has_groups, wei_dims, wei_dt, prb->wtag);
+    auto bia_d = dnn_mem_t::init_md(1, bia_dims, bia_dt, bia_tag);
+    auto dst_d = dnn_mem_t::init_md(prb->ndims, dst_dims, dst_dt, dst_tag);
 
     dnnl_dim_t strides_nd[] = {prb->sd, prb->sh, prb->sw};
     dnnl_dim_t dilates_nd[] = {prb->dd, prb->dh, prb->dw};
@@ -306,6 +301,7 @@ int doit(const prb_t *prb, res_t *res) {
     const auto &scratchpad_md = q(DNNL_ARG_SCRATCHPAD);
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
     dnn_mem_t src_dt(src_md, test_engine);
     dnn_mem_t wei_dt(wei_md, test_engine);
@@ -316,12 +312,12 @@ int doit(const prb_t *prb, res_t *res) {
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
     const auto fp = dnnl_f32;
-    dnn_mem_t src_fp(src_md, fp, tag::abx, test_engine);
-    dnn_mem_t wei_fp(wei_md, fp, tag::abx, test_engine);
-    dnn_mem_t bia_fp(bia_md, fp, tag::x, test_engine);
-    dnn_mem_t dst_fp(dst_md, fp, tag::abx, test_engine);
-    dnn_mem_t fused_wei_fp(fused_wei_md, fp, tag::abx, test_engine);
-    dnn_mem_t fused_bia_fp(fused_bia_md, fp, tag::x, test_engine);
+    dnn_mem_t src_fp(src_md, fp, tag::abx, ref_engine);
+    dnn_mem_t wei_fp(wei_md, fp, tag::abx, ref_engine);
+    dnn_mem_t bia_fp(bia_md, fp, tag::x, ref_engine);
+    dnn_mem_t dst_fp(dst_md, fp, tag::abx, ref_engine);
+    dnn_mem_t fused_wei_fp(fused_wei_md, fp, tag::abx, ref_engine);
+    dnn_mem_t fused_bia_fp(fused_bia_md, fp, tag::x, ref_engine);
 
     std::vector<dnn_mem_t> binary_po_dt;
     std::vector<int> binary_po_args;
@@ -369,10 +365,10 @@ int doit(const prb_t *prb, res_t *res) {
     dnn_mem_t dst_dt0(dst_md0, test_engine);
     dnn_mem_t scratchpad_dt0(scratchpad_md0, test_engine);
 
-    dnn_mem_t src_fp0(src_md0, fp, tag::abx, test_engine);
-    dnn_mem_t wei_fp0(wei_md0, fp, tag::abx, test_engine);
-    dnn_mem_t bia_fp0(bia_md0, fp, tag::x, test_engine);
-    dnn_mem_t dst_fp0(dst_md0, fp, tag::abx, test_engine);
+    dnn_mem_t src_fp0(src_md0, fp, tag::abx, ref_engine);
+    dnn_mem_t wei_fp0(wei_md0, fp, tag::abx, ref_engine);
+    dnn_mem_t bia_fp0(bia_md0, fp, tag::x, ref_engine);
+    dnn_mem_t dst_fp0(dst_md0, fp, tag::abx, ref_engine);
 
     std::vector<dnn_mem_t> binary_po_fp0, binary_po_dt0;
     std::vector<int> binary_po_args0;
@@ -424,9 +420,9 @@ int doit(const prb_t *prb, res_t *res) {
     dnn_mem_t dst_dt1(dst_md1, test_engine);
     dnn_mem_t scratchpad_dt1(scratchpad_md1, test_engine);
 
-    dnn_mem_t wei_fp1(wei_md1, fp, tag::abx, test_engine);
-    dnn_mem_t bia_fp1(bia_md1, fp, tag::x, test_engine);
-    dnn_mem_t dst_fp1(dst_md1, fp, tag::abx, test_engine);
+    dnn_mem_t wei_fp1(wei_md1, fp, tag::abx, ref_engine);
+    dnn_mem_t bia_fp1(bia_md1, fp, tag::x, ref_engine);
+    dnn_mem_t dst_fp1(dst_md1, fp, tag::abx, ref_engine);
 
     std::vector<dnn_mem_t> binary_po_fp1, binary_po_dt1;
     std::vector<int> binary_po_args1;
@@ -455,7 +451,7 @@ int doit(const prb_t *prb, res_t *res) {
     if (fused_bia_md.data_type != dnnl_data_type_undef)
         SAFE(fused_bia_dt.reorder(bia_fp1), WARN);
 
-    args_t args, args0, args1;
+    args_t args, args0, args1, ref_args;
 
     if (prb->dir & FLAG_FWD) {
         args0.set(DNNL_ARG_SRC, src_dt0);
@@ -513,16 +509,20 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
         args.set(binary_po_args, binary_po_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            dnn_mem_t dst_fused(dst_dt, fp, tag::abx, test_engine);
-            dnn_mem_t dst_unfused(dst_dt1, fp, tag::abx, test_engine);
+            compare::compare_t cmp;
+            cmp.set_data_kind(DST);
             // Used p1 to avoid writing separate compare function. Compare uses
             // prb->cfg which can be u8s8u8 while after fusion it may be u8s8s8,
             // thus, compare() will saturate values which is not correct.
-            SAFE(conv::compare_data(p1.get(), DST, dst_fused, dst_unfused, res),
-                    WARN);
+            conv::setup_cmp(cmp, p1.get(), DST, ref_args);
+
+            dnn_mem_t dst_fused(dst_dt, fp, tag::abx, test_engine);
+            dnn_mem_t dst_unfused(dst_dt1, fp, tag::abx, test_engine);
+
+            cmp.compare(dst_unfused, dst_fused, prb->attr, res);
         }
     } else {
         assert(!"Backward is not supported");

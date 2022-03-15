@@ -28,8 +28,8 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_debug.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 #ifdef DNNL_EXPERIMENTAL
 #include "src/common/experimental.hpp"
@@ -54,13 +54,13 @@ std::string flags2str(flags_t flags);
 struct desc_t {
     int64_t mb, ic, id, ih, iw;
     float eps;
-    const char *name;
+    std::string name;
     int ndims;
 };
 int str2desc(desc_t *desc, const char *str);
 std::ostream &operator<<(std::ostream &s, const desc_t &d);
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -74,22 +74,13 @@ struct settings_t {
     std::vector<dnnl_data_type_t> dt {dnnl_f32};
     std::vector<std::string> tag {tag::abx};
     std::vector<flags_t> flags {NONE};
-    std::vector<int64_t> mb {0};
-    std::vector<bool> inplace {false};
-    std::vector<attr_t::post_ops_t> post_ops {attr_t::post_ops_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
-    attr_t attr = {};
     check_alg_t check_alg = ALG_AUTO;
     bool debug_check_ws = false;
-    const char *pattern = NULL;
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%dir%,%dt%,%tag%,%attr%,%flags%,%"
-              "DESC%,%-time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dir%,%dt%,%tag%,%flags%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -154,7 +145,7 @@ struct perf_report_t : public base_perf_report_t {
 
     const attr_t *attr() const override { return &p_->attr; }
     const int64_t *user_mb() const override { return &p_->user_mb; }
-    const char *name() const override { return p_->name; }
+    const std::string *name() const override { return &p_->name; }
     const dir_t *dir() const override { return &p_->dir; }
     const dnnl_data_type_t *dt() const override { return &p_->dt; }
     const std::string *tag() const override { return &tag_; }
@@ -186,13 +177,8 @@ inline void inv_data_off(const prb_t *prb, size_t off, int64_t &mb, int64_t &c,
     assert(off == 0);
 }
 
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &mean, const dnn_mem_t &var, const dnn_mem_t &ss,
-        const dnn_mem_t &sh, dnn_mem_t &ws, dnn_mem_t &dst, dnn_mem_t &src_hat);
-void compute_ref_bwd(const prb_t *prb, const dnn_mem_t &src_hat,
-        const dnn_mem_t &var, const dnn_mem_t &d_dst, const dnn_mem_t &ss,
-        const dnn_mem_t &sh, const dnn_mem_t &ws, dnn_mem_t &d_src,
-        dnn_mem_t &d_ss, dnn_mem_t &d_sh);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);

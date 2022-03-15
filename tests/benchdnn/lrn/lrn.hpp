@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2021 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_debug.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace lrn {
 
@@ -41,13 +41,13 @@ struct desc_t {
     int64_t mb, ic, id, ih, iw;
     int64_t ls;
     float alpha, beta, k;
-    const char *name;
+    std::string name;
     int ndims;
 };
 int str2desc(desc_t *desc, const char *str);
 std::ostream &operator<<(std::ostream &s, const desc_t &d);
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -61,16 +61,11 @@ struct settings_t {
     std::vector<dnnl_data_type_t> dt {dnnl_f32};
     std::vector<std::string> tag {tag::abx};
     std::vector<alg_t> alg {ACROSS};
-    std::vector<int64_t> mb {0};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%dir%,%dt%,%tag%,%alg%,%DESC%,%-"
-              "time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dir%,%dt%,%tag%,%alg%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -119,7 +114,7 @@ struct perf_report_t : public base_perf_report_t {
     }
 
     const int64_t *user_mb() const override { return &p_->user_mb; }
-    const char *name() const override { return p_->name; }
+    const std::string *name() const override { return &p_->name; }
     const dir_t *dir() const override { return &p_->dir; }
     const dnnl_data_type_t *dt() const override { return &p_->dt; }
     const std::string *tag() const override { return &tag_; }
@@ -148,9 +143,8 @@ inline size_t data_off(const prb_t *prb, int64_t mb, int64_t c, int64_t d,
     return (((mb * prb->ic + c) * prb->id + d) * prb->ih + h) * prb->iw + w;
 }
 
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src, dnn_mem_t &dst);
-void compute_ref_bwd(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &d_dst, dnn_mem_t &d_src);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);

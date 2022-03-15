@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2021 Intel Corporation
+* Copyright 2018-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,11 +20,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "shuffle/shuffle.hpp"
 
@@ -43,7 +42,7 @@ int fill_src(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const int range = get_range(prb->dt);
     const int f_min = prb->dt == dnnl_u8 ? 0 : -range / 2;
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const float gen = ((97 * i) + 101) % range;
         const float value = (prb->dt == dnnl_bf16 || prb->dt == dnnl_f16)
                 ? (f_min + gen) / range
@@ -61,9 +60,8 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         const_dnnl_primitive_desc_t hint) {
     dnnl_shuffle_desc_t sd;
 
-    dnnl_memory_desc_t data_d;
-    SAFE(init_md(&data_d, prb->ndims, prb->dims.data(), prb->dt, prb->tag),
-            WARN);
+    auto data_d = dnn_mem_t::init_md(
+            prb->ndims, prb->dims.data(), prb->dt, prb->tag);
 
     if (prb->dir & FLAG_FWD) {
         auto prop_kind = prb->dir & FLAG_INF ? dnnl_forward_inference
@@ -125,6 +123,9 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -152,32 +153,48 @@ int doit(const prb_t *prb, res_t *res) {
             = prb->dir & FLAG_FWD ? q(DNNL_ARG_SRC) : q(DNNL_ARG_DIFF_SRC);
     const auto &scratchpad_md = q(DNNL_ARG_SCRATCHPAD);
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(data_md, dnnl_f32, tag::abx, test_engine);
+    dnn_mem_t src_fp(data_md, dnnl_f32, tag::abx, ref_engine);
     dnn_mem_t src_dt(data_md, test_engine);
 
-    dnn_mem_t dst_fp(data_md, dnnl_f32, tag::abx, test_engine);
+    dnn_mem_t dst_fp(data_md, dnnl_f32, tag::abx, ref_engine);
     dnn_mem_t dst_dt(data_md, test_engine);
 
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
-    SAFE(fill_src(prb, src_dt, src_fp), WARN);
+    args_t args, ref_args;
 
-    const int i_arg = prb->dir == FWD_D ? DNNL_ARG_SRC : DNNL_ARG_DIFF_DST;
-    const int o_arg = prb->dir == FWD_D ? DNNL_ARG_DST : DNNL_ARG_DIFF_SRC;
+    if (prb->dir & FLAG_FWD) {
+        SAFE(fill_src(prb, src_dt, src_fp), WARN);
 
-    args_t args;
+        args.set(DNNL_ARG_SRC, src_dt);
+        args.set(DNNL_ARG_DST, dst_dt);
+        args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-    args.set(i_arg, src_dt);
-    args.set(o_arg, dst_dt);
-    args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+        if (is_bench_mode(CORR)) {
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
 
-    if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref(prb, src_fp, dst_fp));
-        compare::compare_t cmp;
-        SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
+        }
+    } else {
+        SAFE(fill_src(prb, dst_dt, dst_fp), WARN);
+
+        args.set(DNNL_ARG_DIFF_DST, dst_dt);
+        args.set(DNNL_ARG_DIFF_SRC, src_dt);
+        args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
+
+        SAFE(execute_and_wait(prim, args, res), WARN);
+
+        if (is_bench_mode(CORR)) {
+            ref_args.set(DNNL_ARG_DIFF_DST, dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, src_fp);
+
+            check_correctness(prb, {SRC}, args, ref_args, setup_cmp, res);
+        }
     }
 
     return measure_perf(res, prim, args);

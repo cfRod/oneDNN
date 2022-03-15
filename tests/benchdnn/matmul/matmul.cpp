@@ -22,11 +22,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "matmul/matmul.hpp"
@@ -52,8 +51,6 @@ dims_t get_runtime_dims(const dims_t &dims, const dims_mask_t &mask) {
 static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &mpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
-
-    dnnl_memory_desc_t src_d, wei_d, dst_d, bia_d {};
     const auto &src_rt_dims
             = get_runtime_dims(prb->src_dims(), prb->src_runtime_dim_mask());
     const auto &weights_rt_dims = get_runtime_dims(
@@ -61,25 +58,20 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
     const auto &dst_rt_dims
             = get_runtime_dims(prb->dst_dims, prb->dst_runtime_dim_mask());
 
-    SAFE(init_md(&src_d, prb->ndims, src_rt_dims.data(), prb->cfg[SRC].dt,
-                 prb->stag, prb->strides[STRIDES_SRC]),
-            CRIT);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, src_rt_dims.data(),
+            prb->cfg[SRC].dt, prb->stag, prb->strides[STRIDES_SRC]);
+    auto wei_d = dnn_mem_t::init_md(prb->ndims, weights_rt_dims.data(),
+            prb->cfg[WEI].dt, prb->wtag, prb->strides[STRIDES_WEI]);
+    auto dst_d = dnn_mem_t::init_md(prb->ndims, dst_rt_dims.data(),
+            prb->cfg[DST].dt, prb->dtag, prb->strides[STRIDES_DST]);
 
-    SAFE(init_md(&wei_d, prb->ndims, weights_rt_dims.data(), prb->cfg[WEI].dt,
-                 prb->wtag, prb->strides[STRIDES_WEI]),
-            CRIT);
-
-    SAFE(init_md(&dst_d, prb->ndims, dst_rt_dims.data(), prb->cfg[DST].dt,
-                 prb->dtag, prb->strides[STRIDES_DST]),
-            CRIT);
-
+    dnnl_memory_desc_t bia_d {};
     if (prb->bia_dt != dnnl_data_type_undef) {
         dims_t bia_dims;
         prep_bia_dims(prb, bia_dims);
         bia_dims = get_runtime_dims(bia_dims, prb->dst_runtime_dim_mask());
-        DNN_SAFE(dnnl_memory_desc_init_by_strides(&bia_d, prb->ndims,
-                         bia_dims.data(), prb->bia_dt, nullptr),
-                WARN);
+        bia_d = dnn_mem_t::init_md(prb->ndims, bia_dims.data(), prb->bia_dt,
+                prb->dst_runtime_dim_mask() != 0 ? tag::abx : tag::any);
     }
 
     dnnl_matmul_desc_t op_d;
@@ -187,7 +179,7 @@ int fill_data(data_kind_t kind, const prb_t *prb, dnn_mem_t &mem_dt,
     const int64_t n_chunks = 16;
     const int64_t chunk_size = div_up(nelems, n_chunks);
 
-    dnnl::impl::parallel_nd(n_chunks, [&](int64_t idx_chunk) {
+    benchdnn_parallel_nd(n_chunks, [&](int64_t idx_chunk) {
         int64_t idx_start = idx_chunk * chunk_size;
         int64_t idx_end = MIN2(idx_start + chunk_size, nelems);
         // Note: we use a different seed for each chunk to avoid
@@ -364,6 +356,12 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    cmp.set_threshold(prb->cfg[kind].eps);
+    cmp.set_zero_trust_percent(90.f); // TODO: why so bad filling?
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -399,31 +397,28 @@ int doit(const prb_t *prb, res_t *res) {
     const auto &src_dims = prb->src_dims();
     if (dnnl_memory_desc_equal(&src_md, &def_md)) {
         assert(prb->stag != tag::any);
-        SAFE(init_md(&src_md, prb->ndims, src_dims.data(), prb->cfg[SRC].dt,
-                     prb->stag, prb->strides[STRIDES_SRC]),
-                WARN);
+        src_md = dnn_mem_t::init_md(prb->ndims, src_dims.data(),
+                prb->cfg[SRC].dt, prb->stag, prb->strides[STRIDES_SRC]);
     }
 
     const auto &weights_dims = prb->weights_dims();
     if (dnnl_memory_desc_equal(&wei_md, &def_md)) {
         assert(prb->wtag != tag::any);
-        SAFE(init_md(&wei_md, prb->ndims, weights_dims.data(), prb->cfg[WEI].dt,
-                     prb->wtag, prb->strides[STRIDES_WEI]),
-                WARN);
+        wei_md = dnn_mem_t::init_md(prb->ndims, weights_dims.data(),
+                prb->cfg[WEI].dt, prb->wtag, prb->strides[STRIDES_WEI]);
     }
 
     if (dnnl_memory_desc_equal(&dst_md, &def_md)) {
         assert(prb->dtag != tag::any);
-        SAFE(init_md(&dst_md, prb->ndims, prb->dst_dims.data(),
-                     prb->cfg[DST].dt, prb->dtag, prb->strides[STRIDES_DST]),
-                WARN);
+        dst_md = dnn_mem_t::init_md(prb->ndims, prb->dst_dims.data(),
+                prb->cfg[DST].dt, prb->dtag, prb->strides[STRIDES_DST]);
     }
-    if (prb->bia_dt != dnnl_data_type_undef) {
+    if (prb->bia_dt != dnnl_data_type_undef
+            && dnnl_memory_desc_equal(&bia_md, &def_md)) {
         dims_t bia_dims;
         prep_bia_dims(prb, bia_dims);
-        DNN_SAFE(dnnl_memory_desc_init_by_strides(&bia_md, prb->ndims,
-                         bia_dims.data(), prb->bia_dt, nullptr),
-                WARN);
+        bia_md = dnn_mem_t::init_md(
+                prb->ndims, bia_dims.data(), prb->bia_dt, tag::abx);
     }
 
     const auto &scratchpad_md = q(DNNL_ARG_SCRATCHPAD);
@@ -442,7 +437,7 @@ int doit(const prb_t *prb, res_t *res) {
     };
 
     const auto &test_engine = get_test_engine();
-    const auto &ref_engine = prim_ref ? get_cpu_engine() : get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
     dnn_mem_t src_dt(src_md, test_engine);
     dnn_mem_t wei_dt(wei_md, test_engine);
@@ -488,7 +483,7 @@ int doit(const prb_t *prb, res_t *res) {
     std::vector<dnn_mem_t> binary_po_fp, binary_po_dt;
     std::vector<int> binary_po_args;
     SAFE(binary::setup_binary_po(const_pd, binary_po_args, binary_po_dt,
-                 binary_po_fp, ref_engine, false, true),
+                 binary_po_fp, /*only_positive=*/false, /*only_integer=*/true),
             WARN);
 
     args_t args, ref_args;
@@ -504,7 +499,7 @@ int doit(const prb_t *prb, res_t *res) {
     args.set(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, dst_zero_points_m);
     args.set(binary_po_args, binary_po_dt);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     if (is_bench_mode(CORR)) {
         ref_args.set(DNNL_ARG_SRC, src_fp);
@@ -515,12 +510,7 @@ int doit(const prb_t *prb, res_t *res) {
         ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
         ref_args.set(binary_po_args, binary_po_fp);
 
-        TIME_REF(compute_ref(prb, prim_ref, ref_args));
-        compare::compare_t cmp;
-        cmp.set_threshold(prb->cfg[DST].eps);
-        cmp.set_data_kind(DST);
-        cmp.set_zero_trust_percent(90.f); // TODO: why so bad filling?
-        SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prim_ref);
     }
 
     return measure_perf(res, prim, args);

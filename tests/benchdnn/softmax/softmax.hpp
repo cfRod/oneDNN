@@ -24,8 +24,8 @@
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace softmax {
 
@@ -40,7 +40,7 @@ alg_t str2alg(const char *str);
 const char *alg2str(alg_t alg);
 dnnl_alg_kind_t alg2alg_kind(alg_t alg);
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -55,18 +55,12 @@ struct settings_t {
     std::vector<std::string> stag {tag::abx}, dtag {tag::any};
     std::vector<alg_t> alg {SOFTMAX};
     std::vector<int> axis {1};
-    std::vector<int64_t> mb {0};
-    std::vector<bool> inplace {false};
-    std::vector<attr_t::scale_t> oscale {attr_t::scale_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%dir%,%sdt%,%ddt%,%stag%,%dtag%,%alg%,%"
-              "axis%,%DESC%,%-time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args
+                = "%dir%,%sdt%,%ddt%,%stag%,%dtag%,%alg%,%axis%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -126,6 +120,7 @@ struct perf_report_t : public base_perf_report_t {
 
     void dump_desc_csv(std::ostream &s) const override { dump_desc(s); }
 
+    const std::string *name() const override { return &p_->name; }
     const int *axis() const override { return &p_->axis; }
     const dir_t *dir() const override { return &p_->dir; }
     const std::vector<dnnl_data_type_t> *sdt() const override { return &sdt_; }
@@ -164,9 +159,8 @@ inline void get_sizes(const prb_t *prb, int64_t &outer_size,
     axis_size = prb->dims[prb->axis];
 }
 
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src, dnn_mem_t &dst);
-void compute_ref_bwd(const prb_t *prb, const dnn_mem_t &dst,
-        const dnn_mem_t &diff_dst, dnn_mem_t &diff_src);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);

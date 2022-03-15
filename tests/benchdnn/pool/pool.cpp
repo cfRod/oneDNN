@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,11 +21,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "pool/pool.hpp"
@@ -42,7 +41,7 @@ int fill_dat(const prb_t *prb, data_kind_t kind, dnn_mem_t &mem_dt,
     const int64_t ker_size {prb->kd * prb->kh * prb->kw};
     const auto &c = prb->cfg[kind];
 
-    dnnl::impl::parallel_nd(MB, IC, D, H, W,
+    benchdnn_parallel_nd(MB, IC, D, H, W,
             [&](int64_t mb, int64_t ic, int64_t d, int64_t h, int64_t w) {
                 const int64_t factor = prb->alg == max ? 1 : ker_size;
                 // keep values for avg_exclude_pad positive to prevent cancellation err
@@ -78,7 +77,7 @@ int fill_dst(
 // anything else) in case of a bug in the library
 int fill_ws(
         const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp, res_t *res) {
-    dnnl::impl::parallel_nd(mem_fp.nelems(),
+    benchdnn_parallel_nd(mem_fp.nelems(),
             [&](int64_t i) { mem_fp.set_elem(i, (1 << 24) - 1); });
 
     SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -89,8 +88,6 @@ int fill_ws(
 static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &ppd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
-    dnnl_memory_desc_t src_d, dst_d;
-
     dnnl_dims_t src_1d_dims = {prb->mb, prb->ic, prb->iw};
     dnnl_dims_t src_2d_dims = {prb->mb, prb->ic, prb->ih, prb->iw};
     dnnl_dims_t src_3d_dims = {prb->mb, prb->ic, prb->id, prb->ih, prb->iw};
@@ -106,13 +103,11 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
             : prb->ndims == 4 ? dst_2d_dims : dst_1d_dims;
 
     const auto src_tag = (dir & FLAG_FWD) ? prb->tag : tag::any;
-    const auto dst_tag = tag::any;
 
-    SAFE(init_md(&src_d, prb->ndims, src_dims, prb->cfg[SRC].dt, src_tag),
-            CRIT);
-
-    SAFE(init_md(&dst_d, prb->ndims, dst_dims, prb->cfg[DST].dt, dst_tag),
-            CRIT);
+    auto src_d = dnn_mem_t::init_md(
+            prb->ndims, src_dims, prb->cfg[SRC].dt, src_tag);
+    auto dst_d = dnn_mem_t::init_md(
+            prb->ndims, dst_dims, prb->cfg[DST].dt, tag::any);
 
     dnnl_dim_t strides_nd[] = {prb->sd, prb->sh, prb->sw};
     dnnl_dim_t kernel_nd[] = {prb->kd, prb->kh, prb->kw};
@@ -215,6 +210,24 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    cmp.set_threshold(prb->cfg[kind].eps);
+    cmp.set_zero_trust_percent(100.f); // TODO: consider enabling
+
+    const auto pooling_add_check
+            = [&](const compare::compare_t::driver_check_func_args_t &args) {
+                  // cuDNN bug: it spits fp16 min value as -inf,
+                  // not -65504.
+                  if (is_nvidia_gpu() && args.dt == dnnl_f16) {
+                      return args.exp == lowest_dt(args.dt)
+                              && std::isinf(args.got) && std::signbit(args.got);
+                  }
+                  return false;
+              };
+    cmp.set_driver_check_function(pooling_add_check);
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -249,15 +262,16 @@ int doit(const prb_t *prb, res_t *res) {
     const auto tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(src_md, fp, tag, test_engine);
+    dnn_mem_t src_fp(src_md, fp, tag, ref_engine);
     dnn_mem_t src_dt(src_md, test_engine);
 
-    dnn_mem_t dst_fp(dst_md, fp, tag, test_engine);
+    dnn_mem_t dst_fp(dst_md, fp, tag, ref_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
 
     if (prb->dir & FLAG_INF) SAFE(ws_md.ndims == 0 ? OK : FAIL, WARN);
-    dnn_mem_t ws_fp(ws_md, test_engine);
+    dnn_mem_t ws_fp(ws_md, dnnl_s32, tag::abx, ref_engine);
     dnn_mem_t ws_dt(ws_md, test_engine);
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
     std::vector<dnn_mem_t> binary_po_fp, binary_po_dt;
@@ -270,39 +284,25 @@ int doit(const prb_t *prb, res_t *res) {
 
     SAFE(fill_src(prb, src_dt, src_fp, res), WARN);
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC, src_dt);
     args.set(DNNL_ARG_DST, dst_dt);
     args.set(DNNL_ARG_WORKSPACE, ws_dt);
     args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
     args.set(binary_po_args, binary_po_dt);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     // want this pass on backward to get ws_fp filled properly
     if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref_fwd(prb, src_fp, binary_po_fp, dst_fp, ws_fp));
         if (prb->dir & FLAG_FWD) {
-            compare::compare_t cmp;
-            cmp.set_threshold(prb->cfg[DST].eps);
-            cmp.set_data_kind(DST);
-            cmp.set_zero_trust_percent(100.f); // TODO: consider enabling
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+            ref_args.set(DNNL_ARG_WORKSPACE, ws_fp);
+            ref_args.set(binary_po_args, binary_po_fp);
 
-            const auto pooling_add_check
-                    = [&](const compare::compare_t::driver_check_func_args_t
-                                      &args) {
-                          // cuDNN bug: it spits fp16 min value as -inf,
-                          // not -65504.
-                          if (is_nvidia_gpu() && args.dt == dnnl_f16) {
-                              return args.exp == lowest_dt(args.dt)
-                                      && std::isinf(args.got)
-                                      && std::signbit(args.got);
-                          }
-                          return false;
-                      };
-            cmp.set_driver_check_function(pooling_add_check);
-
-            SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
         }
     }
 
@@ -323,10 +323,10 @@ int doit(const prb_t *prb, res_t *res) {
         const auto &d_src_md = q(const_bpd, DNNL_ARG_DIFF_SRC);
         const auto &d_scratchpad_md = q(const_bpd, DNNL_ARG_SCRATCHPAD);
 
-        dnn_mem_t d_dst_fp = dnn_mem_t(d_dst_md, fp, tag, test_engine);
+        dnn_mem_t d_dst_fp = dnn_mem_t(d_dst_md, fp, tag, ref_engine);
         d_dst_dt = dnn_mem_t(d_dst_md, prb->cfg[DST].dt, test_engine);
 
-        dnn_mem_t d_src_fp = dnn_mem_t(d_src_md, fp, tag, test_engine);
+        dnn_mem_t d_src_fp = dnn_mem_t(d_src_md, fp, tag, ref_engine);
         d_src_dt = dnn_mem_t(d_src_md, prb->cfg[SRC].dt, test_engine);
 
         scratchpad_dt = dnn_mem_t(d_scratchpad_md, test_engine);
@@ -339,15 +339,17 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_WORKSPACE, ws_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_bwd(prb, d_src_fp, d_dst_fp, ws_fp));
-            compare::compare_t cmp;
-            cmp.set_threshold(prb->cfg[SRC].eps);
-            cmp.set_data_kind(SRC);
-            cmp.set_zero_trust_percent(100.f); // TODO: consider enabling
-            SAFE(cmp.compare(d_src_fp, d_src_dt, prb->attr, res), WARN);
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+            ref_args.set(DNNL_ARG_WORKSPACE, ws_fp);
+            ref_args.set(binary_po_args, binary_po_fp);
+            ref_args.set(DNNL_ARG_DIFF_DST, d_dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, d_src_fp);
+
+            check_correctness(prb, {SRC}, args, ref_args, setup_cmp, res);
         }
     }
 

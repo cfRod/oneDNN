@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2021 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -22,11 +22,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "lrn/lrn.hpp"
 
@@ -38,7 +37,7 @@ int fill_dat(const prb_t *prb, data_kind_t kind, dnn_mem_t &mem_dt,
     const int range = 16;
     const int f_min = prb->dt == dnnl_u8 ? 0 : -range / 2;
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const int64_t gen = kind == SRC ? 1091 * i + 1637 : 1279 * i + 1009;
         const float value = f_min + gen % range;
         mem_fp.set_elem(i, value);
@@ -61,7 +60,6 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &lpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_lrn_desc_t ld;
-    dnnl_memory_desc_t data_d;
 
     dnnl_dims_t data_dims_0d = {prb->mb, prb->ic};
     dnnl_dims_t data_dims_1d = {prb->mb, prb->ic, prb->iw};
@@ -73,7 +71,7 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
             : prb->ndims == 4 ? data_dims_2d
                               : prb->ndims == 3 ? data_dims_1d : data_dims_0d;
 
-    SAFE(init_md(&data_d, prb->ndims, data_dims, prb->dt, prb->tag), CRIT);
+    auto data_d = dnn_mem_t::init_md(prb->ndims, data_dims, prb->dt, prb->tag);
 
     dnnl_alg_kind_t alg = alg2alg_kind(prb->alg);
     if (dir & FLAG_FWD) {
@@ -133,6 +131,12 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    // `3` is a const needed to adjust division error
+    cmp.set_threshold(compute_n_summands(prb) * 3 * epsilon_dt(prb->dt));
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -164,15 +168,16 @@ int doit(const prb_t *prb, res_t *res) {
     const auto tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(data_md, fp, tag, test_engine);
+    dnn_mem_t src_fp(data_md, fp, tag, ref_engine);
     dnn_mem_t src_dt(data_md, test_engine);
 
-    dnn_mem_t dst_fp(data_md, fp, tag, test_engine);
+    dnn_mem_t dst_fp(data_md, fp, tag, ref_engine);
     dnn_mem_t dst_dt(data_md, test_engine);
 
     if (prb->dir & FLAG_INF) SAFE(ws_md.ndims == 0 ? OK : FAIL, WARN);
-    dnn_mem_t ws_fp(ws_md, test_engine);
+    dnn_mem_t ws_fp(ws_md, ref_engine);
     dnn_mem_t ws_dt(ws_md, test_engine);
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
@@ -180,22 +185,21 @@ int doit(const prb_t *prb, res_t *res) {
 
     SAFE(fill_src(prb, src_dt, src_fp), WARN);
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC, src_dt);
     args.set(DNNL_ARG_DST, dst_dt);
     args.set(DNNL_ARG_WORKSPACE, ws_dt);
     args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     if (prb->dir & FLAG_FWD) {
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_fwd(prb, src_fp, dst_fp));
-            compare::compare_t cmp;
-            // `3` is a const needed to adjust division error
-            cmp.set_threshold(compute_n_summands(prb) * 3
-                    * epsilon_dt(dst_dt.md_.data_type));
-            SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+
+            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
         }
     }
 
@@ -215,10 +219,10 @@ int doit(const prb_t *prb, res_t *res) {
         const auto &d_data_md = q(const_bpd, DNNL_ARG_DIFF_DST);
         const auto &d_scratchpad_md = q(const_bpd, DNNL_ARG_SCRATCHPAD);
 
-        dnn_mem_t d_dst_fp(d_data_md, fp, tag, test_engine);
+        dnn_mem_t d_dst_fp(d_data_md, fp, tag, ref_engine);
         d_dst_dt = dnn_mem_t(d_data_md, test_engine);
 
-        dnn_mem_t d_src_fp(d_data_md, fp, tag, test_engine);
+        dnn_mem_t d_src_fp(d_data_md, fp, tag, ref_engine);
         d_src_dt = dnn_mem_t(d_data_md, test_engine);
 
         scratchpad_dt = dnn_mem_t(d_scratchpad_md, test_engine);
@@ -232,15 +236,14 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_WORKSPACE, ws_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_bwd(prb, src_fp, d_dst_fp, d_src_fp));
-            compare::compare_t cmp;
-            // `3` is a const needed to adjust division error
-            cmp.set_threshold(compute_n_summands(prb) * 3
-                    * epsilon_dt(d_src_dt.md_.data_type));
-            SAFE(cmp.compare(d_src_fp, d_src_dt, prb->attr, res), WARN);
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DIFF_DST, d_dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, d_src_fp);
+
+            check_correctness(prb, {SRC}, args, ref_args, setup_cmp, res);
         }
     }
 

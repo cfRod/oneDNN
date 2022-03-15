@@ -25,12 +25,12 @@
 #include <utility>
 #include <vector>
 
-#include "dnnl.h"
+#include "oneapi/dnnl/dnnl.h"
 
 #include "common.hpp"
 #include "utils/parser.hpp"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 // BENCHDNN_MEMORY_CHECK macro enables guarding mechanism for memory allocation:
 // memory block is allocated on a page boundary and the page after the block is
@@ -68,6 +68,7 @@ const char *state2str(res_state_t state) {
     CASE(UNIMPLEMENTED);
     CASE(FAILED);
     CASE(LISTED);
+    CASE(EXECUTED);
 #undef CASE
     assert(!"unknown res state");
     return "STATE_UNDEF";
@@ -87,66 +88,54 @@ const char *skip_reason2str(skip_reason_t skip_reason) {
     return "SKIP_UNKNOWN";
 }
 
-void parse_result(
-        res_t &res, bool &want_perf_report, int status, const char *pstr) {
+void parse_result(res_t &res, const char *pstr) {
     auto &bs = benchdnn_stat;
     const char *state = state2str(res.state);
-    want_perf_report = false;
 
     switch (res.state) {
         case UNTESTED:
+            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
+            bs.failed++;
+            break;
+        case EXECUTED:
             if (is_bench_mode(PERF)) {
-                want_perf_report = true;
-                if (status == FAIL)
-                    bs.failed++;
-                else
-                    bs.passed++;
-                break;
+                bs.passed++;
             } else if (is_bench_mode(RUN)) {
-                assert(status == OK);
-                BENCHDNN_PRINT(0, "%d:EXECUTED __REPRO: %s\n", bs.tests, pstr);
+                BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
                 break;
             }
         case FAILED:
-            assert(status == FAIL);
             bs.failed++;
             BENCHDNN_PRINT(0, "%d:%s (errors:%lu total:%lu) __REPRO: %s\n",
                     bs.tests, state, (unsigned long)res.errors,
                     (unsigned long)res.total, pstr);
             break;
         case SKIPPED:
-            assert(status == OK);
             BENCHDNN_PRINT(0, "%d:%s (%s) __REPRO: %s\n", bs.tests, state,
                     skip_reason2str(res.reason), pstr);
             bs.skipped++;
             break;
         case UNIMPLEMENTED:
-            assert(status == OK);
             BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
             bs.unimplemented++;
             bs.failed++;
             break;
         case MISTRUSTED:
-            assert(status == OK);
             BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            want_perf_report = true;
             bs.mistrusted++;
             break;
         case PASSED:
-            assert(status == OK);
             BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            want_perf_report = true;
             bs.passed++;
             break;
         case LISTED:
-            assert(status == OK);
             BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
             bs.listed++;
             break;
         default: assert(!"unknown state"); SAFE_V(FAIL);
     }
 
-    if (want_perf_report && is_bench_mode(PERF)) {
+    if (is_bench_mode(PERF)) {
         using bt = timer::timer_t;
         const auto &t = res.timer_map.perf_timer();
         for (int mode = 0; mode < (int)bt::n_modes; ++mode)
@@ -526,7 +515,7 @@ void gemm(const char *layout, const char *transa, const char *transb, int64_t m,
         return b[j * ldb + i];
     };
 
-    dnnl::impl::parallel_nd(m, n, [&](int64_t i, int64_t j) {
+    benchdnn_parallel_nd(m, n, [&](int64_t i, int64_t j) {
         float ab = 0.0f;
         for (int64_t _k = 0; _k < k; ++_k)
             ab += a_accessor(i, _k) * b_accessor(_k, j);

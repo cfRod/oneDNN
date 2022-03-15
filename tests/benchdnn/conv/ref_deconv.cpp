@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Intel Corporation
+* Copyright 2021-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "tests/test_thread.hpp"
+#include <utility>
+
+#include "utils/parallel.hpp"
 
 #include "conv/deconv.hpp"
 
 namespace deconv {
 
 void compute_ref_fwd(
-        const conv::prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const conv::prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
@@ -50,7 +52,7 @@ void compute_ref_fwd(
 }
 
 void compute_ref_bwd_d(
-        const conv::prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const conv::prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
@@ -79,7 +81,7 @@ void compute_ref_bwd_d(
 }
 
 void compute_ref_bwd_w(
-        const conv::prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const conv::prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
@@ -126,7 +128,7 @@ void compute_ref_bwd_w(
         const int64_t OH = prb->ih; // prb.oh = p_tr.ih
         const int64_t OW = prb->iw; // prb.ow = p_tr.iw
 
-        dnnl::impl::parallel_nd(G, OCG, [&](int64_t g, int64_t oc) {
+        benchdnn_parallel_nd(G, OCG, [&](int64_t g, int64_t oc) {
             size_t bia_off = g * OCG + oc;
             double sum = 0;
 
@@ -141,6 +143,25 @@ void compute_ref_bwd_w(
             ((float *)diff_bia_m)[bia_off] = (float)sum;
         });
     }
+}
+
+// This is dispatched from conv::compute_ref. See additional comment there.
+void compute_ref(
+        const conv::prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
+    // Update prb descriptor to re-use convolution reference.
+    conv::prb_t prb_tr((conv::desc_t)*prb, prb->dir, prb->cfg, prb->stag,
+            prb->wtag, prb->dtag, prb->alg, prb->attr, prb->mb, true);
+    std::swap(prb_tr.ic, prb_tr.oc);
+    std::swap(prb_tr.ih, prb_tr.oh);
+    std::swap(prb_tr.id, prb_tr.od);
+    std::swap(prb_tr.iw, prb_tr.ow);
+
+    if (prb->dir & FLAG_FWD)
+        compute_ref_fwd(&prb_tr, args, prim_ref);
+    else if (prb->dir == BWD_D)
+        compute_ref_bwd_d(&prb_tr, args, prim_ref);
+    else if (prb->dir & FLAG_BWD && prb->dir & FLAG_WEI)
+        compute_ref_bwd_w(&prb_tr, args, prim_ref);
 }
 
 } // namespace deconv

@@ -605,7 +605,10 @@ float compute_blocking_heuristic_avx512(brgemm_matmul_conf_t &bgmmc,
         if (low_spatial_work || bwd_w_low_spatial_work) {
 
             // Reduce n_blk size to increase parallel space
-            if (!bm_conf_utils.check_n_blk_fixed())
+            // note: over reduction of n_blk size on 2d shapes when n_chunks == 1
+            // showed significant performance degradation
+            if (!bm_conf_utils.check_n_blk_fixed()
+                    && IMPLICATION(n_chunks == 1, bgmmc.batch_ndims > 0))
                 n_blk = nstl::min(matmul.N, 32);
 
             // force to plain B (wei) in small spatial size for FWD:
@@ -872,7 +875,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
     // - nthr_K
     CHECK(compute_blocking_heuristic(bgmmc, bm_conf_utils));
 
-    if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N >= bgmmc.wei_n_blk) {
+    if (bgmmc.wei_n_blk > bgmmc.N_blk
+            && IMPLICATION(
+                    bgmmc.N == bgmmc.N_blk, bgmmc.N >= bgmmc.wei_n_blk)) {
         bgmmc.wei_n_blk = bgmmc.N_blk;
         CHECK(bm_conf_utils.update_and_check_B_tag(
                 weights_md, bgmmc.wei_n_blk));

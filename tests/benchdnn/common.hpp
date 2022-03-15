@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2021 Intel Corporation
+* Copyright 2017-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -144,7 +144,8 @@ enum res_state_t {
     MISTRUSTED,
     UNIMPLEMENTED,
     FAILED,
-    LISTED
+    LISTED,
+    EXECUTED,
 };
 const char *state2str(res_state_t state);
 
@@ -169,8 +170,7 @@ struct res_t {
     size_t ibytes, obytes;
 };
 
-void parse_result(
-        res_t &res, bool &want_perf_report, int status, const char *pstr);
+void parse_result(res_t &res, const char *pstr);
 
 /* misc */
 void init_fp_mode();

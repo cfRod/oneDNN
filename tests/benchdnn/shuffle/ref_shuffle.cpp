@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2021 Intel Corporation
+* Copyright 2018-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,11 +15,19 @@
 *******************************************************************************/
 
 #include "shuffle/shuffle.hpp"
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 namespace shuffle {
 
-void compute_ref(const prb_t *prb, const dnn_mem_t &src, dnn_mem_t &dst) {
+void compute_ref(
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
+    const int src_arg = prb->dir == FWD_D ? DNNL_ARG_SRC : DNNL_ARG_DIFF_DST;
+    const int dst_arg = prb->dir == FWD_D ? DNNL_ARG_DST : DNNL_ARG_DIFF_SRC;
+    const dnn_mem_t &src = args.find(src_arg);
+    const dnn_mem_t &dst = args.find(dst_arg);
+
+    float *dst_ptr = (float *)dst;
+
     const int axis = prb->axis;
     const int64_t group_size = prb->group;
     const int64_t axis_size = prb->dims[axis];
@@ -45,11 +53,11 @@ void compute_ref(const prb_t *prb, const dnn_mem_t &src, dnn_mem_t &dst) {
         inner_size *= (size_t)prb->dims[i];
     const size_t dim = axis_size * inner_size;
 
-    dnnl::impl::parallel_nd(outer_size, axis_size, inner_size,
+    benchdnn_parallel_nd(outer_size, axis_size, inner_size,
             [&](int64_t ou, int64_t a, int64_t in) {
                 auto src_off = ou * dim + a * inner_size + in;
                 auto dst_off = ou * dim + transpose(a) * inner_size + in;
-                dst.set_elem(dst_off, src.get_elem(src_off));
+                dst_ptr[dst_off] = src.get_elem(src_off);
             });
 }
 

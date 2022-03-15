@@ -109,15 +109,21 @@ const char *data_kind2str(data_kind_t kind) {
         case BIA: return "BIA";
         case DST: return "DST";
         case ACC: return "ACC";
-        case DATA: return "DATA";
         case MEAN: return "MEAN";
         case VAR: return "VAR";
         case SS: return "SS";
         case SC: return "SC";
         case SH: return "SH";
-        case GWEI: return "GWEI";
+        case DST_ITER: return "DST_ITER";
+        case DST_ITER_C: return "DST_ITER_C";
+        case AUGRU_ATTENTION: return "AUGRU_ATTENTION";
+        case SRC_ITER: return "SRC_ITER";
+        case SRC_ITER_C: return "SRC_ITER_C";
+        case WEI_ITER: return "WEI_ITER";
+        case WEI_PEEPHOLE: return "WEI_PEEPHOLE";
+        case WEI_PROJECTION: return "WEI_PROJECTION";
+        default: assert(!"incorrect data kind");
     }
-    assert(!"incorrect data kind");
     return "incorrect data kind";
 }
 
@@ -864,9 +870,8 @@ int attr_args_t::prepare_post_ops_mds(
                 rhs_tensor_dims[d] = (!(mask & (1 << d))) ? 1 : dims[d];
 
             dnnl_memory_desc_t rhs_tensor_desc;
-            SAFE(init_md(&rhs_tensor_desc, ndims, rhs_tensor_dims,
-                         po_rhs_tensor_entry.dt, po_rhs_tensor_entry.tag),
-                    WARN);
+            rhs_tensor_desc = dnn_mem_t::init_md(ndims, rhs_tensor_dims,
+                    po_rhs_tensor_entry.dt, po_rhs_tensor_entry.tag);
             mds.emplace((DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
                                 | po_rhs_tensor_entry.arg_attr_mask),
                     rhs_tensor_desc);

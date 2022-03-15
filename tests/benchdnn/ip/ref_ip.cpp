@@ -14,7 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "ip/ip.hpp"
 
@@ -36,7 +36,7 @@ void compute_ref_fwd_ip(const prb_t *prb, const args_t &args) {
             (float *)dst_tmp, N);
 
     auto v_po_masks = prb->attr.post_ops.get_po_masks();
-    dnnl::impl::parallel_nd(prb->mb, prb->oc, [&](int64_t mb, int64_t oc) {
+    benchdnn_parallel_nd(prb->mb, prb->oc, [&](int64_t mb, int64_t oc) {
         size_t dst_off = dst_off_f(prb, mb, oc);
         float &dst = ((float *)dst_m)[dst_off];
 
@@ -84,7 +84,7 @@ void compute_ref_bwd_w_ip(const prb_t *prb, const args_t &args) {
 
     if (!(prb->dir & FLAG_BIA)) return;
 
-    dnnl::impl::parallel_nd(prb->oc, [&](int64_t oc) {
+    benchdnn_parallel_nd(prb->oc, [&](int64_t oc) {
         size_t bia_off = bia_off_f(prb, oc);
         float &db = ((float *)diff_bia_m)[bia_off];
         db = 0;
@@ -96,7 +96,7 @@ void compute_ref_bwd_w_ip(const prb_t *prb, const args_t &args) {
 }
 
 void compute_ref_fwd(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
@@ -106,7 +106,7 @@ void compute_ref_fwd(
 }
 
 void compute_ref_bwd_d(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
@@ -116,13 +116,23 @@ void compute_ref_bwd_d(
 }
 
 void compute_ref_bwd_w(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args) {
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
     if (prim_ref) {
         SAFE_V(execute_and_wait(prim_ref, args));
         return;
     }
 
     compute_ref_bwd_w_ip(prb, args);
+}
+
+void compute_ref(
+        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
+    if (prb->dir & FLAG_FWD)
+        compute_ref_fwd(prb, args, prim_ref);
+    else if (prb->dir == BWD_D)
+        compute_ref_bwd_d(prb, args, prim_ref);
+    else if (prb->dir & FLAG_BWD && prb->dir & FLAG_WEI)
+        compute_ref_bwd_w(prb, args, prim_ref);
 }
 
 } // namespace ip

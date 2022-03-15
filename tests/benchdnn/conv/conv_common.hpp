@@ -26,8 +26,9 @@
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
+#include "utils/compare.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace conv {
 
@@ -55,7 +56,7 @@ struct desc_t {
     int64_t dd, dh, dw;
     bool has_groups;
 
-    const char *name;
+    std::string name;
     int ndims;
 
     // Initialize dependent opposite-side paddings values
@@ -110,7 +111,7 @@ const dt_conf_t *str2cfg(const char *str);
 std::ostream &operator<<(std::ostream &s, const dt_conf_t *cfg);
 const dt_conf_t *auto_cfg(const alg_t alg, const dt_conf_t *cfg);
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -123,23 +124,13 @@ struct settings_t {
     std::vector<dir_t> dir {FWD_B};
     std::vector<const dt_conf_t *> cfg {conf_f32};
     std::vector<std::string> stag {tag::any}, wtag {tag::any}, dtag {tag::any};
-    std::vector<int64_t> mb {0};
     std::vector<alg_t> alg {DIRECT};
-    std::vector<attr_t::scale_t> oscale {attr_t::scale_t()};
-    std::vector<attr_t::zero_points_t> zero_points {attr_t::zero_points_t()};
-    std::vector<attr_t::post_ops_t> post_ops {attr_t::post_ops_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
-    attr_t attr = {};
-    const char *pattern = NULL;
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%dir%,%cfg%,%alg%,%attr%,%DESC%,"
-              "%Gops%,%Gfreq%,%-time%,%-Gflops%,%0time%,%0Gflops%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%Gops%,%Gfreq%,%-time%,%-"
-              "Gflops%,%0time%,%0Gflops%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args
+                = "%dir%,%cfg%,%stag%,%wtag%,%dtag%,%alg%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -242,7 +233,7 @@ struct perf_report_t : public base_perf_report_t {
     double ops() const override { return p_->ops; }
     const attr_t *attr() const override { return &p_->attr; }
     const int64_t *user_mb() const override { return &p_->user_mb; }
-    const char *name() const override { return p_->name; }
+    const std::string *name() const override { return &p_->name; }
     const dir_t *dir() const override { return &p_->dir; }
     const std::vector<std::string> *stag() const override { return &stag_; }
     const std::string *wtag() const override { return &wtag_; }
@@ -347,12 +338,11 @@ inline void inv_dst_off_f(const prb_t *prb, int64_t off, int64_t &mb,
 
 float oscale(const prb_t *prb, int oc);
 
-void compute_ref_fwd(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args);
-void compute_ref_bwd_d(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args);
-void compute_ref_bwd_w(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
+
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args);
 
 void compute_ref_direct_fwd(const prb_t *prb, const args_t &args);
 void compute_ref_direct_bwd_d(const prb_t *prb, const args_t &args);

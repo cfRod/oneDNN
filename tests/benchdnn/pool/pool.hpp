@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace pool {
 
@@ -54,7 +54,7 @@ struct desc_t {
     int64_t pd, ph, pw;
     int64_t pd_r, ph_r, pw_r; // End side padding for each dimension
 
-    const char *name;
+    std::string name;
     int ndims;
 
     // Initialize dependent opposite-side paddings values from the shape
@@ -101,7 +101,7 @@ extern const _dt_conf_t conf_f32;
 const dt_conf_t *str2cfg(const char *str);
 std::ostream &operator<<(std::ostream &s, const dt_conf_t *cfg);
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -115,17 +115,11 @@ struct settings_t {
     std::vector<const dt_conf_t *> cfg {conf_f32};
     std::vector<std::string> tag {tag::abx};
     std::vector<alg_t> alg {max};
-    std::vector<int64_t> mb {0};
-    std::vector<attr_t::post_ops_t> post_ops {attr_t::post_ops_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%dir%,%cfg%,%tag%,%alg%,%DESC%,%-"
-              "time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dir%,%cfg%,%tag%,%alg%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -151,6 +145,8 @@ struct prb_t : public desc_t {
     alg_t alg;
     attr_t attr;
     int64_t user_mb;
+
+    int64_t kernel_size() const { return kd * kh * kw; }
 
     BENCHDNN_DISALLOW_COPY_AND_ASSIGN(prb_t);
 };
@@ -187,7 +183,7 @@ struct perf_report_t : public base_perf_report_t {
     }
 
     const int64_t *user_mb() const override { return &p_->user_mb; }
-    const char *name() const override { return p_->name; }
+    const std::string *name() const override { return &p_->name; }
     const dir_t *dir() const override { return &p_->dir; }
     const std::string *tag() const override { return &tag_; }
 
@@ -241,10 +237,8 @@ inline int64_t get_num_summands(
                     * (KW - iw_start_excluded - iw_end_excluded);
 }
 
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src,
-        const std::vector<dnn_mem_t> &binary_po, dnn_mem_t &dst, dnn_mem_t &ws);
-void compute_ref_bwd(const prb_t *prb, dnn_mem_t &diff_src,
-        const dnn_mem_t &diff_dst, const dnn_mem_t &ws);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int compare_src(
         const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp, res_t *res);

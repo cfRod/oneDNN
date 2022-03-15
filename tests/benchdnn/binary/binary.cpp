@@ -14,17 +14,18 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <algorithm>
+
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "eltwise/eltwise.hpp"
@@ -41,7 +42,7 @@ int fill_mem(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
     const int range = 16;
     const int f_min = dt == dnnl_u8 ? 0 : -range / 2;
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const int64_t gen = (12 * i + 5 * input_idx + 16) % (range + 1);
         const float scale = only_integer_values ? 1.f : 1.25f;
         float value = (f_min + gen) * scale;
@@ -58,8 +59,7 @@ int fill_mem(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
 
 int setup_binary_po(const_dnnl_primitive_desc_t pd, std::vector<int> &args,
         std::vector<dnn_mem_t> &mem_dt, std::vector<dnn_mem_t> &mem_fp,
-        const dnnl_engine_t &ref_engine, bool only_positive_values,
-        bool only_integer_values) {
+        bool only_positive_values, bool only_integer_values) {
     // TODO: currently run-time dimensions are not supported in binary post-op.
     // To add a support two ways are possible: 1) add query support to the
     // library and extract expected md from pd; 2) pass a vector of pre-defined
@@ -86,7 +86,7 @@ int setup_binary_po(const_dnnl_primitive_desc_t pd, std::vector<int> &args,
 
         // Following call can not be executed if po_md has runtime dimension due
         // to undefined size.
-        mem_fp.emplace_back(po_md, dnnl_f32, tag::abx, ref_engine);
+        mem_fp.emplace_back(po_md, dnnl_f32, tag::abx, get_cpu_engine());
         mem_dt.emplace_back(po_md, get_test_engine());
         args.push_back(po_idx);
         fill_mem(po_idx, mem_dt.back(), mem_fp.back(), only_positive_values,
@@ -99,19 +99,16 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &bpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_binary_desc_t bd;
-    std::vector<dnnl_memory_desc_t> src_d;
-    src_d.resize(prb->n_inputs());
+    std::vector<dnnl_memory_desc_t> src_d(prb->n_inputs());
 
     for (int i_input = 0; i_input < prb->n_inputs(); ++i_input) {
         const dims_t &i_vdims = prb->vdims[i_input];
-        SAFE(init_md(&src_d[i_input], prb->ndims, i_vdims.data(),
-                     prb->sdt[i_input], prb->stag[i_input]),
-                CRIT);
+        src_d[i_input] = dnn_mem_t::init_md(prb->ndims, i_vdims.data(),
+                prb->sdt[i_input], prb->stag[i_input]);
     }
 
-    dnnl_memory_desc_t dst_d;
-    SAFE(init_md(&dst_d, prb->ndims, prb->dst_dims.data(), prb->ddt, prb->dtag),
-            WARN);
+    auto dst_d = dnn_mem_t::init_md(
+            prb->ndims, prb->dst_dims.data(), prb->ddt, prb->dtag);
 
     dnnl_alg_kind_t alg = attr_t::post_ops_t::kind2dnnl_kind(prb->alg);
 
@@ -194,6 +191,31 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    cmp.set_threshold(epsilon_dt(prb->ddt));
+    // Since lambda is called when stack is unavailable, need to capture `prb`
+    // by value to avoid using dangling references.
+    const auto binary_add_check
+            = [prb](const compare::compare_t::driver_check_func_args_t &args) {
+                  // fp16 result can slightly mismatch for division due to
+                  // difference in backends implementations.
+                  return prb->alg == alg_t::DIV
+                          ? args.diff < epsilon_dt(args.dt)
+                          : false;
+              };
+    cmp.set_driver_check_function(binary_add_check);
+
+    const std::vector<alg_t> cmp_alg = {
+            alg_t::GE, alg_t::GT, alg_t::LE, alg_t::LT, alg_t::EQ, alg_t::NE};
+    const bool is_cmp = std::any_of(
+            cmp_alg.cbegin(), cmp_alg.cend(), [&](const alg_t alg) {
+                return (prb->alg == alg) || prb->attr.post_ops.find(alg) >= 0;
+            });
+
+    if (is_cmp) cmp.set_zero_trust_percent(99.f);
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -225,16 +247,17 @@ int doit(const prb_t *prb, res_t *res) {
     const auto tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src0_fp(src0_md, fp, tag, test_engine);
+    dnn_mem_t src0_fp(src0_md, fp, tag, ref_engine);
     dnn_mem_t src0_dt(src0_md, test_engine);
     SAFE(fill_mem(0, src0_dt, src0_fp), WARN);
 
-    dnn_mem_t src1_fp(src1_md, fp, tag, test_engine);
+    dnn_mem_t src1_fp(src1_md, fp, tag, ref_engine);
     dnn_mem_t src1_dt(src1_md, test_engine);
     SAFE(fill_mem(1, src1_dt, src1_fp), WARN);
 
-    dnn_mem_t dst_fp(dst_md, fp, tag, test_engine);
+    dnn_mem_t dst_fp(dst_md, fp, tag, ref_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
     if (prb->attr.post_ops.find(alg_t::SUM) >= 0)
         SAFE(fill_mem(2, dst_dt, dst_fp), WARN);
@@ -245,7 +268,8 @@ int doit(const prb_t *prb, res_t *res) {
     SAFE(setup_binary_po(const_pd, binary_po_args, binary_po_dt, binary_po_fp),
             WARN);
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC_0, src0_dt);
     args.set(DNNL_ARG_SRC_1, src1_dt);
     args.set(DNNL_ARG_DST, dst_dt);
@@ -263,33 +287,15 @@ int doit(const prb_t *prb, res_t *res) {
             input_scales_m1, prb->attr.scales.get(DNNL_ARG_SRC_1), 1, &scale1);
     args.set(DNNL_ARG_ATTR_INPUT_SCALES | DNNL_ARG_SRC_1, input_scales_m1);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref(prb, src0_fp, src1_fp, binary_po_fp, dst_fp));
+        ref_args.set(DNNL_ARG_SRC_0, src0_fp);
+        ref_args.set(DNNL_ARG_SRC_1, src1_fp);
+        ref_args.set(DNNL_ARG_DST, dst_fp);
+        ref_args.set(binary_po_args, binary_po_fp);
 
-        compare::compare_t cmp;
-        cmp.set_threshold(epsilon_dt(dst_dt.dt()));
-        const auto binary_add_check =
-                [&](const compare::compare_t::driver_check_func_args_t &args) {
-                    // fp16 result can slightly mismatch for division due to difference
-                    // in backends implementations.
-                    return prb->alg == alg_t::DIV
-                            ? args.diff < epsilon_dt(args.dt)
-                            : false;
-                };
-        cmp.set_driver_check_function(binary_add_check);
-
-        const std::vector<alg_t> cmp_alg = {alg_t::GE, alg_t::GT, alg_t::LE,
-                alg_t::LT, alg_t::EQ, alg_t::NE};
-        const bool is_cmp = std::any_of(
-                cmp_alg.cbegin(), cmp_alg.cend(), [&](const alg_t alg) {
-                    return (prb->alg == alg)
-                            || prb->attr.post_ops.find(alg) >= 0;
-                });
-
-        if (is_cmp) cmp.set_zero_trust_percent(100.f);
-        SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
     }
 
     return measure_perf(res, prim, args);

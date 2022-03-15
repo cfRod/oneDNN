@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@
 
 #include "common.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace matmul {
 
@@ -47,7 +47,7 @@ extern const _dt_conf_t conf_f32;
 const int64_t LD_GOOD = INT64_MAX;
 const int64_t LD_NONE = INT64_MAX - 1;
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -63,20 +63,11 @@ struct settings_t {
     std::vector<dnnl_data_type_t> bia_dt {dnnl_data_type_undef};
     std::vector<int> bia_mask {2};
     std::vector<std::vector<dims_mask_t>> rt_dims_masks {{}};
-    std::vector<attr_t::scale_t> oscale {attr_t::scale_t()};
-    std::vector<attr_t::zero_points_t> zero_points {attr_t::zero_points_t()};
-    std::vector<attr_t::post_ops_t> post_ops {attr_t::post_ops_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
-    attr_t attr = {};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%name%,%cfg%,%attr%,%DESC%,"
-              "%Gops%,%Gfreq%,%-time%,%-Gflops%,%0time%,%0Gflops%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%name%,%prb%,%Gops%,%Gfreq%,%-time%,%-"
-              "Gflops%,%0time%,%0Gflops%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%cfg%,%stag%,%wtag%,%dtag%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -202,7 +193,7 @@ struct perf_report_t : public base_perf_report_t {
 
     double ops() const override { return p_->ops; }
     const attr_t *attr() const override { return &p_->attr; }
-    const char *name() const override { return p_->name.c_str(); }
+    const std::string *name() const override { return &p_->name; }
     const std::vector<std::string> *stag() const override { return &stag_; }
     const std::string *wtag() const override { return &wtag_; }
     const std::string *dtag() const override { return &dtag_; }
@@ -225,8 +216,8 @@ inline int64_t dst_off_f(const prb_t *prb, int64_t mb, int64_t m, int64_t n) {
     return (mb * prb->m + m) * prb->n + n;
 }
 
-void compute_ref(
-        const prb_t *prb, dnnl_primitive_t prim_ref, const args_t &args);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 

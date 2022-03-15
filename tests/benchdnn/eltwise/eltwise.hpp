@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,14 +24,14 @@
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace eltwise {
 
 using alg_t = attr_t::post_ops_t::kind_t;
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -46,18 +46,11 @@ struct settings_t {
     std::vector<std::string> tag {tag::abx};
     std::vector<alg_t> alg {alg_t::RELU};
     std::vector<float> scales {0, 0.25, -0.25}, alpha {scales}, beta {scales};
-    std::vector<int64_t> mb {0};
-    std::vector<bool> inplace {false};
-    std::vector<attr_t::post_ops_t> post_ops {attr_t::post_ops_t()};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%dir%,%dt%,%tag%,%alg%,%DESC%,%-time%,%"
-              "0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dir%,%dt%,%tag%,%alg%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -112,6 +105,7 @@ struct perf_report_t : public base_perf_report_t {
 
     void dump_desc_csv(std::ostream &s) const override { dump_desc(s); }
 
+    const std::string *name() const override { return &p_->name; }
     const dir_t *dir() const override { return &p_->dir; }
     const dnnl_data_type_t *dt() const override { return &p_->dt; }
     const int64_t *user_mb() const override { return &p_->user_mb; }
@@ -123,10 +117,8 @@ private:
 };
 
 float get_eltwise_threshold(dnnl_data_type_t dt, alg_t alg, bool is_fwd = true);
-void compute_ref_fwd(const prb_t *prb, const dnn_mem_t &src,
-        const std::vector<dnn_mem_t> &binary_po, dnn_mem_t &dst);
-void compute_ref_bwd(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &diff_dst, dnn_mem_t &diff_src);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
 
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);

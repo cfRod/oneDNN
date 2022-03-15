@@ -25,11 +25,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "norm.hpp"
 
 #include "bnorm/bnorm.hpp"
 
@@ -41,7 +40,7 @@ static int prepare_fwd_with_stats(const prb_t *prb, dnn_mem_t &src,
     const bool use_sc = prb->use_sc();
     const bool use_sh = prb->use_sh();
 
-    dnnl::impl::parallel_nd(prb->ic, [&](int64_t c) {
+    benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
         mean.set_elem(c, 4 * ((c % 5) - 2));
         var.set_elem(c, ((c % 7) << 1));
 
@@ -56,7 +55,7 @@ static int prepare_fwd_with_stats(const prb_t *prb, dnn_mem_t &src,
         }
     });
 
-    dnnl::impl::parallel_nd(prb->ic, prb->mb, prb->id, prb->ih, prb->iw,
+    benchdnn_parallel_nd(prb->ic, prb->mb, prb->id, prb->ih, prb->iw,
             [&](int64_t c, int64_t mb, int64_t d, int64_t h, int64_t w) {
                 int64_t l_base = mb * prb->id * prb->ih * prb->iw + c * 239 * 2;
                 float *s = (float *)src + data_off(prb, mb, c, 0, 0, 0);
@@ -122,7 +121,7 @@ static int prepare_fwd_no_stats(const prb_t *prb, dnn_mem_t &src,
     const bool use_sc = prb->use_sc();
     const bool use_sh = prb->use_sh();
 
-    dnnl::impl::parallel_nd(prb->ic, [&](int64_t c) {
+    benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
         const float m = ((float *)mean)[c]
                 = alg == ALG_0 ? 0.f : 0.25f * (1 << (c % 7));
         float v = 0; /* current variance */
@@ -192,7 +191,7 @@ static int prepare_bwd(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const int64_t n_chunks = 16;
     const int64_t chunk_size = div_up(nelems, n_chunks);
 
-    dnnl::impl::parallel_nd(n_chunks, [&](int64_t idx_chunk) {
+    benchdnn_parallel_nd(n_chunks, [&](int64_t idx_chunk) {
         int64_t idx_start = idx_chunk * chunk_size;
         int64_t idx_end = MIN2(idx_start + chunk_size, nelems);
 
@@ -220,161 +219,6 @@ static int prepare_bwd(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     SAFE(mem_dt.reorder(mem_fp), WARN);
 
     return OK;
-}
-
-static int compare(const prb_t *prb, data_kind_t kind, const dnn_mem_t &fp_mem,
-        const dnn_mem_t &dt_mem, res_t *res, const dnn_mem_t *ss = nullptr,
-        const dnn_mem_t *sh = nullptr) {
-    const char *skind = data_kind2str(kind);
-
-    const int f32_mant_digits = 24;
-    const float eps_coeff = (1 << (f32_mant_digits - digits_dt(prb->dt)));
-    float eps = eps_coeff * (kind == DATA ? 5e-7 : 0);
-    if ((kind == SS || kind == SC || kind == SH) && prb->dir & FLAG_BWD)
-        eps = eps_coeff * 5e-6;
-
-    if (is_nvidia_gpu()) {
-        // cuDNN stores unbiased variance which requires rescaling by
-        // `(N - 1) / N`, where `N = MB * Spatial`. Hence, we cannot set the
-        // threshold to 0...
-        // Also the mean could also be rounded incorrectly (how?!)
-        if (kind == MEAN) eps = 1e-7;
-        if (kind == VAR) eps = 4e-7;
-    }
-
-#ifdef DNNL_EXPERIMENTAL
-    const bool use_relaxed_validation
-            = dnnl::impl::experimental::use_bnorm_stats_one_pass();
-#else
-    const bool use_relaxed_validation = false;
-#endif
-    if (use_relaxed_validation) {
-        // On Intel GPUs mean and variance could be rounded incorrectly because
-        // they are calculated using fast but potentially unstable formula.
-        if (kind == MEAN) eps = 1e-7;
-        if (kind == VAR) eps = 4e-7;
-    }
-
-    // Since bwd testing is done using results from forward which are random
-    // fp32 values, diff_ss starts fluctuating, so we check norm for both data
-    // and SS, SC and SH.
-    const bool rely_on_norm = prb->dir & FLAG_BWD;
-
-    const int64_t N = kind == DATA ? prb->mb : 1;
-    const int64_t C = kind == DATA ? prb->ic : prb->ic * (kind == SS ? 2 : 1);
-    const int64_t SP = kind == DATA ? prb->id * prb->ih * prb->iw : 1;
-
-    const bool use_sc = prb->use_sc();
-    const bool use_sh = prb->use_sh();
-
-    const auto nelems = N * C * SP;
-    if (nelems == 0) return res->state = PASSED, OK;
-
-    res->total += rely_on_norm ? 1 : nelems;
-
-    diff_norm_t diff_norm;
-    for_(int64_t n = 0; n < N; n++)
-    for_(int64_t c = 0; c < C; c++)
-    for (int64_t sp = 0; sp < SP; ++sp) {
-        int64_t i = (n * C + c) * SP + sp;
-        const float dt = dt_mem.get_elem(i);
-        const float fp0 = fp_mem.get_elem(i);
-        const float fp = kind == DATA
-                ? round_to_nearest_representable(prb->dt, fp0)
-                : fp0;
-        float diff = 0.f, rel_diff = 0.f;
-        bool ok = true;
-
-        if (rely_on_norm) {
-            diff_norm.update(fp, dt);
-        } else {
-            diff = fabsf(fp - dt);
-            rel_diff = diff / (fabsf(fp) > FLT_MIN ? fabsf(fp) : 1);
-            ok = (fabsf(fp) > 1e-5 ? rel_diff : diff) <= eps;
-
-            /* When the error is larger than eps, It could be
-             * due to catastrophic cancellation in final result
-             * which is computed as `Y = a * X + b`.
-             * When `a * X`  is close to `b` and `sign(a * X) = - sign(b)`.
-             * Then large error in `a * X` could result in a final
-             * result (which has a cancellation i.e. `|Y| = |a*X - (-b)|`)
-             * which has no meaningful digits left in mantissa.*/
-            if (!ok && (prb->dir & FLAG_FWD) && kind == DATA && ss && sh) {
-                const float beta = (use_sc || use_sh)
-                        ? ((const float *)*sh)[c]
-                        : ((const float *)*ss)[prb->ic + c];
-                /* Using an empirically derived threshold,
-                 * check if cancellation error
-                 * in `|Y| = |a*X - (-b)|` is huge.*/
-                bool maybe_cancellation_error
-                        = (fabsf(fp - beta)
-                                  / (fabsf(fp) > FLT_MIN ? fabsf(fp) : 1))
-                        > 1.0f;
-                if (maybe_cancellation_error) {
-                    /* Check for error in `a * X` */
-                    float diff_aX = fabsf((fp - beta) - (dt - beta));
-                    float rel_diff_aX = diff_aX
-                            / (fabsf(fp - beta) > FLT_MIN ? fabsf(fp - beta)
-                                                          : 1);
-                    ok = rel_diff_aX <= eps;
-                }
-            }
-
-            res->errors += !ok;
-        }
-
-        bool dump = (!ok && (res->errors < 10 || verbose >= 10))
-                || (verbose >= 99);
-        if (dump) {
-            std::stringstream ss;
-            if (kind == DATA) {
-                int64_t mb, c, d, h, w;
-                inv_data_off(prb, i, mb, c, d, h, w);
-                ss << mb << "," << c << "," << d << "," << h << "," << w;
-            } else if (kind == SS) {
-                ss << i / prb->ic << "," << i % prb->ic;
-            } else {
-                ss << i;
-            }
-
-            std::string ind_str = ss.str();
-            BENCHDNN_PRINT(0,
-                    "[%4ld][%s%s][%s] fp:%8g dt:%8g diff:%8g rdiff:%8g\n",
-                    (long)i, prb->dir & FLAG_BWD ? "D_" : "", skind,
-                    ind_str.c_str(), fp, dt, diff, rel_diff);
-        }
-    }
-
-    if (rely_on_norm) {
-        diff_norm.done();
-        const bool ok = diff_norm.rel_diff(norm_t::L1) <= eps
-                && diff_norm.rel_diff(norm_t::L2) <= eps
-                && diff_norm.rel_diff(norm_t::L8) <= eps;
-        res->errors += !ok;
-
-        if (res->errors || verbose >= 5) {
-            const int vl = res->errors ? 0 : 2;
-            BENCHDNN_PRINT(vl,
-                    "@@@ [%s%s] diff: l0(``%g``) "
-                    "l1:(%g,%g,%g,``%g``) "
-                    "l2:(%g,%g,%g,``%g``) "
-                    "l8:(%g,%g,%g,``%g``)\n",
-                    prb->dir & FLAG_BWD ? "D_" : "", skind,
-                    diff_norm.rel_diff(norm_t::L0), diff_norm.a_[norm_t::L1],
-                    diff_norm.b_[norm_t::L1], diff_norm.diff_[norm_t::L1],
-                    diff_norm.rel_diff(norm_t::L1), diff_norm.a_[norm_t::L2],
-                    diff_norm.b_[norm_t::L2], diff_norm.diff_[norm_t::L2],
-                    diff_norm.rel_diff(norm_t::L2), diff_norm.a_[norm_t::L8],
-                    diff_norm.b_[norm_t::L8], diff_norm.diff_[norm_t::L8],
-                    diff_norm.rel_diff(norm_t::L8));
-        }
-    }
-
-    if (res->errors) res->state = FAILED;
-
-    if (res->state == UNTESTED) res->state = PASSED; /* optimism */
-
-    return res->state == FAILED ? FAIL : OK;
 }
 
 int check_fwd_ws(const dnn_mem_t &dst_dt, const dnn_mem_t &ws_dt, res_t *res) {
@@ -416,8 +260,7 @@ int check_fwd_ws(const dnn_mem_t &dst_dt, const dnn_mem_t &ws_dt, res_t *res) {
     }
 
     if (res->errors) res->state = FAILED;
-
-    if (res->state == UNTESTED) res->state = PASSED; /* optimism */
+    if (res->state == EXECUTED) res->state = PASSED;
 
     return res->state == FAILED ? FAIL : OK;
 }
@@ -425,7 +268,6 @@ int check_fwd_ws(const dnn_mem_t &dst_dt, const dnn_mem_t &ws_dt, res_t *res) {
 int init_pd(dnnl_engine_t engine, const prb_t *prb, dnnl_primitive_desc_t &bpd,
         res_t *res, dir_t dir, const_dnnl_primitive_desc_t hint) {
     dnnl_batch_normalization_desc_t bd;
-    dnnl_memory_desc_t data_d;
 
     dnnl_dims_t data_dims_0d = {prb->mb, prb->ic};
     dnnl_dims_t data_dims_1d = {prb->mb, prb->ic, prb->iw};
@@ -437,7 +279,7 @@ int init_pd(dnnl_engine_t engine, const prb_t *prb, dnnl_primitive_desc_t &bpd,
             : prb->ndims == 4 ? data_dims_2d
                               : prb->ndims == 3 ? data_dims_1d : data_dims_0d;
 
-    SAFE(init_md(&data_d, prb->ndims, data_dims, prb->dt, prb->tag), CRIT);
+    auto data_d = dnn_mem_t::init_md(prb->ndims, data_dims, prb->dt, prb->tag);
 
     auto flags = (dnnl_normalization_flags_t)prb->flags;
     if (dir & FLAG_FWD) {
@@ -533,6 +375,88 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    // Since bwd testing is done using results from forward which are random
+    // fp32 values, diff_ss starts fluctuating, so we check norm for both data
+    // and SS, SC and SH.
+    const bool compare_with_norm = (prb->dir & FLAG_BWD);
+    cmp.set_norm_validation_mode(compare_with_norm);
+
+    const int f32_mant_digits = 24;
+    const float trh_coeff = (1 << (f32_mant_digits - digits_dt(prb->dt)));
+    float trh = trh_coeff * ((kind == SRC || kind == DST) ? 5e-7 : 0);
+    if ((kind == SS || kind == SC || kind == SH) && prb->dir & FLAG_BWD)
+        trh = trh_coeff * 5e-6;
+
+#ifdef DNNL_EXPERIMENTAL
+    const bool bnorm_single_pass
+            = dnnl::impl::experimental::use_bnorm_stats_one_pass();
+#else
+    const bool bnorm_single_pass = false;
+#endif
+
+    const bool use_relaxed_validation = is_nvidia_gpu() || bnorm_single_pass;
+    if (use_relaxed_validation) {
+        // Nvidia: cuDNN stores unbiased variance which requires rescaling by
+        // `(N - 1) / N`, where `N = MB * Spatial`. Hence, we cannot set the
+        // threshold to 0...
+        // Also mean could be computed using a single pass formula.
+        //
+        // On Intel GPUs mean and variance could be rounded incorrectly because
+        // they are calculated using fast but potentially unstable formula.
+        if (kind == MEAN) trh = 1e-7;
+        if (kind == VAR) trh = 4e-7;
+    }
+    cmp.set_threshold(trh);
+
+    // TODO: improve bf16 filling
+    if (prb->dt == dnnl_bf16) cmp.set_zero_trust_percent(99.f);
+
+    // When the error is larger than `trh`, it could be due to a catastrophic
+    // cancellation in final result which is computed as `Y = a * X + b`.
+    // When `a * X` is close to `b` and their signs are opposite, then large
+    // error in `a * X` could result in a final result (which has a cancellation
+    // i.e. `|Y| = |a*X - (-b)|`), which has no meaningful digits left in
+    // mantissa.
+    //
+    // Since lambda is called when stack is unavailable, need to capture `prb`
+    // and `kind` by value to avoid using dangling references.
+    const auto bnorm_add_check =
+            [&, kind, prb](
+                    const compare::compare_t::driver_check_func_args_t &args) {
+                const bool has_shift = prb->use_sh() || prb->use_ss();
+                if (!((prb->dir & FLAG_FWD) && kind == DST && has_shift))
+                    return false;
+
+                const auto &ss = ref_args.find(DNNL_ARG_SCALE_SHIFT);
+                const auto &sh = ref_args.find(DNNL_ARG_SHIFT);
+                const bool shift_only = prb->use_sh();
+                const float *sh_ptr
+                        = shift_only ? (const float *)sh : (const float *)ss;
+
+                const auto &dst = ref_args.find(DNNL_ARG_DST);
+                const int64_t c = dst.get_scale_idx(
+                        args.idx, 1 << 1 /* channel_mask */);
+                const int64_t c_idx = c + (shift_only ? 0 : prb->ic);
+                const float beta = sh_ptr[c_idx];
+                // Using an empirically derived threshold, check if
+                // cancellation error in `|Y| = |a*X - (-b)|` is huge.
+                const float abs_exp = fabsf(args.exp);
+                const float norm_denom = abs_exp > FLT_MIN ? abs_exp : 1.f;
+                const float abs_exp_delta = fabsf(args.exp - beta);
+                bool maybe_cancel_error = abs_exp_delta / norm_denom > 1.f;
+                if (!maybe_cancel_error) return false;
+
+                // Check for error in `a * X`
+                float diff_aX = fabsf((args.exp - beta) - (args.got - beta));
+                float rel_diff_aX = diff_aX
+                        / (abs_exp_delta > FLT_MIN ? abs_exp_delta : 1.f);
+                return rel_diff_aX <= args.trh;
+            };
+    cmp.set_driver_check_function(bnorm_add_check);
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -570,11 +494,12 @@ int doit(const prb_t *prb, res_t *res) {
     const auto tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(data_md, fp, tag, test_engine);
+    dnn_mem_t src_fp(data_md, fp, tag, ref_engine);
     dnn_mem_t src_dt(data_md, test_engine);
     // stash for bwd: src_hat[i] = (src[i] - mean) / sqrt(var + prb->eps)
-    dnn_mem_t src_hat_fp(data_md, fp, tag, test_engine);
+    dnn_mem_t src_hat_fp(data_md, fp, tag, ref_engine);
 
     dnn_mem_t &dst_fp = src_fp; // in-place in ref code
     dnn_mem_t placeholder_dst_dt;
@@ -585,23 +510,23 @@ int doit(const prb_t *prb, res_t *res) {
     // On inference w/o global stats the batch norm doesn't require stat
     // memories. Hence, we need to prepare the mean_fp and var_fp ourselves.
     const dnnl_dims_t dims1d = {prb->ic};
-    dnn_mem_t mean_fp(1, dims1d, fp, tag::abx, test_engine);
+    dnn_mem_t mean_fp(1, dims1d, fp, tag::abx, ref_engine);
     dnn_mem_t mean_dt(mean_md, test_engine);
-    dnn_mem_t var_fp(1, dims1d, fp, tag::abx, test_engine);
+    dnn_mem_t var_fp(1, dims1d, fp, tag::abx, ref_engine);
     dnn_mem_t var_dt(var_md, test_engine);
 
-    dnn_mem_t ss_fp(ss_md, fp, tag::abx, test_engine);
+    dnn_mem_t ss_fp(ss_md, fp, tag::abx, ref_engine);
     dnn_mem_t ss_dt(ss_md, test_engine);
-    dnn_mem_t d_ss_fp(ss_md, fp, tag::abx, test_engine);
+    dnn_mem_t d_ss_fp(ss_md, fp, tag::abx, ref_engine);
     dnn_mem_t d_ss_dt(ss_md, test_engine);
 
-    dnn_mem_t sh_fp(ss_md, fp, use_sh ? tag::x : tag::axb, test_engine);
+    dnn_mem_t sh_fp(ss_md, fp, use_sh ? tag::x : tag::axb, ref_engine);
     dnn_mem_t sh_dt(ss_md, test_engine);
-    dnn_mem_t d_sh_fp(ss_md, fp, use_sh ? tag::x : tag::axb, test_engine);
+    dnn_mem_t d_sh_fp(ss_md, fp, use_sh ? tag::x : tag::axb, ref_engine);
     dnn_mem_t d_sh_dt(ss_md, test_engine);
 
     if (prb->need_ws()) SAFE(ws_md.ndims != 0 ? OK : FAIL, WARN);
-    dnn_mem_t ws_fp(data_md, dnnl_u8, tag, test_engine);
+    dnn_mem_t ws_fp(data_md, dnnl_u8, tag, ref_engine);
     dnn_mem_t ws_dt(ws_md, test_engine);
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
@@ -619,32 +544,41 @@ int doit(const prb_t *prb, res_t *res) {
     if (use_ss || use_sc) { SAFE(ss_dt.reorder(ss_fp), WARN); }
     if (use_sh) { SAFE(sh_dt.reorder(sh_fp), WARN); }
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC, src_dt);
-    args.set(DNNL_ARG_DST, dst_dt);
     args.set(DNNL_ARG_MEAN, mean_dt);
     args.set(DNNL_ARG_VARIANCE, var_dt);
     args.set(use_sc ? DNNL_ARG_SCALE : DNNL_ARG_SCALE_SHIFT, ss_dt);
     args.set(DNNL_ARG_SHIFT, sh_dt);
     args.set(DNNL_ARG_WORKSPACE, ws_dt);
     args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
+    args.set(DNNL_ARG_DST, dst_dt);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     // Running ref to collect src_hat (used instead of src + mean) and ws, if
     // fuse_relu flag is requested.
     if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref_fwd(prb, src_fp, mean_fp, var_fp, ss_fp, sh_fp,
-                ws_fp, dst_fp, src_hat_fp));
         if (prb->dir & FLAG_FWD) {
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_MEAN, mean_fp);
+            ref_args.set(DNNL_ARG_VARIANCE, var_fp);
+            ref_args.set(use_sc ? DNNL_ARG_SCALE : DNNL_ARG_SCALE_SHIFT, ss_fp);
+            ref_args.set(DNNL_ARG_SHIFT, sh_fp);
+            ref_args.set(DNNL_ARG_WORKSPACE, ws_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+            ref_args.set(DNNL_ARG_DST_1, src_hat_fp); // Reference aux arg.
+
+            std::vector<data_kind_t> kinds {DST};
             if (!(prb->flags & GLOB_STATS) && !(prb->dir & FLAG_INF)) {
-                SAFE(compare(prb, MEAN, mean_fp, mean_dt, res), WARN);
-                SAFE(compare(prb, VAR, var_fp, var_dt, res), WARN);
+                kinds.push_back(MEAN);
+                kinds.push_back(VAR);
             }
-            dnn_mem_t dst(dst_dt, fp, tag, test_engine);
-            SAFE(compare(prb, DATA, dst_fp, dst, res, &ss_fp, &sh_fp), WARN);
-            if (prb->debug_check_ws)
-                SAFE(check_fwd_ws(dst_dt, ws_dt, res), WARN);
+
+            check_correctness(prb, kinds, args, ref_args, setup_cmp, res);
+
+            if (prb->debug_check_ws) check_fwd_ws(dst_dt, ws_dt, res);
         }
     }
 
@@ -663,7 +597,7 @@ int doit(const prb_t *prb, res_t *res) {
         const auto &d_data_md = q(const_bpd, DNNL_ARG_DIFF_DST);
         const auto &d_scratchpad_md = q(const_bpd, DNNL_ARG_SCRATCHPAD);
 
-        dnn_mem_t d_dst_fp(d_data_md, fp, tag, test_engine);
+        dnn_mem_t d_dst_fp(d_data_md, fp, tag, ref_engine);
         d_dst_dt = dnn_mem_t(d_data_md, test_engine);
 
         dnn_mem_t &d_src_fp = d_dst_fp; // in-place in ref code
@@ -678,32 +612,42 @@ int doit(const prb_t *prb, res_t *res) {
 
         args.clear();
         args.set(DNNL_ARG_SRC, src_dt);
-        args.set(DNNL_ARG_DIFF_DST, d_dst_dt);
-        args.set(DNNL_ARG_DIFF_SRC, d_src_dt);
         args.set(DNNL_ARG_MEAN, mean_dt);
         args.set(DNNL_ARG_VARIANCE, var_dt);
+        args.set(DNNL_ARG_DIFF_DST, d_dst_dt);
         args.set(use_sc ? DNNL_ARG_SCALE : DNNL_ARG_SCALE_SHIFT, ss_dt);
+        args.set(DNNL_ARG_SHIFT, sh_dt);
+        args.set(DNNL_ARG_WORKSPACE, ws_dt);
+        args.set(DNNL_ARG_DIFF_SRC, d_src_dt);
         args.set(use_sc ? DNNL_ARG_DIFF_SCALE : DNNL_ARG_DIFF_SCALE_SHIFT,
                 d_ss_dt);
-        args.set(DNNL_ARG_SHIFT, sh_dt);
         args.set(DNNL_ARG_DIFF_SHIFT, d_sh_dt);
-        args.set(DNNL_ARG_WORKSPACE, ws_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_bwd(prb, src_hat_fp, var_fp, d_dst_fp, ss_fp,
-                    sh_fp, ws_fp, d_src_fp, d_ss_fp, d_sh_fp));
-            if ((use_ss || use_sc) && (prb->dir & FLAG_WEI)) {
-                SAFE(compare(prb, use_sc ? SC : SS, d_ss_fp, d_ss_dt, res),
-                        WARN);
-            }
-            if (use_sh && (prb->dir & FLAG_WEI)) {
-                SAFE(compare(prb, SH, d_sh_fp, d_sh_dt, res), WARN);
-            }
-            dnn_mem_t d_src(d_src_dt, fp, tag, test_engine);
-            SAFE(compare(prb, DATA, d_src_fp, d_src, res), WARN);
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_MEAN, mean_fp);
+            ref_args.set(DNNL_ARG_VARIANCE, var_fp);
+            ref_args.set(use_sc ? DNNL_ARG_SCALE : DNNL_ARG_SCALE_SHIFT, ss_fp);
+            ref_args.set(DNNL_ARG_SHIFT, sh_fp);
+            ref_args.set(DNNL_ARG_WORKSPACE, ws_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+            ref_args.set(DNNL_ARG_DST_1, src_hat_fp); // Reference aux arg.
+            ref_args.set(DNNL_ARG_DIFF_DST, d_dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, d_src_fp);
+            ref_args.set(
+                    use_sc ? DNNL_ARG_DIFF_SCALE : DNNL_ARG_DIFF_SCALE_SHIFT,
+                    d_ss_fp);
+            ref_args.set(DNNL_ARG_DIFF_SHIFT, d_sh_fp);
+
+            std::vector<data_kind_t> kinds {SRC};
+            if ((use_ss || use_sc) && (prb->dir & FLAG_WEI))
+                kinds.push_back(use_sc ? SC : SS);
+            if (use_sh && (prb->dir & FLAG_WEI)) kinds.push_back(SH);
+
+            check_correctness(prb, kinds, args, ref_args, setup_cmp, res);
         }
     }
 

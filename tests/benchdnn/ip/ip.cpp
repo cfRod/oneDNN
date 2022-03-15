@@ -23,11 +23,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "ip/ip.hpp"
@@ -38,7 +37,6 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &ippd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_inner_product_desc_t ipd;
-    dnnl_memory_desc_t src_d, wei_d, bia_d, dst_d;
 
     dnnl_dims_t src_dims_0d = {prb->mb, prb->ic};
     dnnl_dims_t src_dims_1d = {prb->mb, prb->ic, prb->iw};
@@ -61,14 +59,12 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
             : prb->ndims == 4 ? wei_dims_2d
                               : prb->ndims == 3 ? wei_dims_1d : wei_dims_0d;
 
-    SAFE(init_md(&src_d, prb->ndims, src_dims, prb->cfg[SRC].dt, prb->stag),
-            CRIT);
-    SAFE(init_md(&wei_d, prb->ndims, wei_dims, prb->cfg[WEI].dt, prb->wtag),
-            CRIT);
-    DNN_SAFE(dnnl_memory_desc_init_by_tag(&bia_d, 1, bia_dims, prb->cfg[BIA].dt,
-                     dnnl_format_tag_any),
-            WARN);
-    SAFE(init_md(&dst_d, 2, dst_dims, prb->cfg[DST].dt, prb->dtag), CRIT);
+    auto src_d = dnn_mem_t::init_md(
+            prb->ndims, src_dims, prb->cfg[SRC].dt, prb->stag);
+    auto wei_d = dnn_mem_t::init_md(
+            prb->ndims, wei_dims, prb->cfg[WEI].dt, prb->wtag);
+    auto bia_d = dnn_mem_t::init_md(1, bia_dims, prb->cfg[BIA].dt, tag::any);
+    auto dst_d = dnn_mem_t::init_md(2, dst_dims, prb->cfg[DST].dt, prb->dtag);
 
     switch (prb->dir) {
         case FWD_D:
@@ -181,7 +177,7 @@ int fill_src(
     const auto &c = prb->cfg[SRC];
     const int range = c.f_max - c.f_min + 1;
 
-    dnnl::impl::parallel_nd(prb->mb, prb->ic, prb->id, prb->ih, prb->iw,
+    benchdnn_parallel_nd(prb->mb, prb->ic, prb->id, prb->ih, prb->iw,
             [&](int64_t mb, int64_t ic, int64_t id, int64_t ih, int64_t iw) {
                 const int gen
                         = 101 * id + 103 * ih + 107 * iw + 109 * mb + 113 * ic;
@@ -205,7 +201,7 @@ int fill_wei(
     const auto &c = prb->cfg[WEI];
     const int range = c.f_max - c.f_min + 1;
 
-    dnnl::impl::parallel_nd(prb->oc, prb->ic, prb->id, prb->ih, prb->iw,
+    benchdnn_parallel_nd(prb->oc, prb->ic, prb->id, prb->ih, prb->iw,
             [&](int64_t oc, int64_t ic, int64_t kd, int64_t kh, int64_t kw) {
                 const int gen = 127 * kd + 131 * kh + 137 * kw + 139 * oc
                         + 149 * ic + 7;
@@ -220,7 +216,7 @@ int fill_wei(
     if (s8_s8 && is_cpu()) {
         // Check that s8 -> s8_comp exists in the library since users may have
         // already quantized data.
-        dnn_mem_t mem_fp_s8(mem_fp.md_, dnnl_s8, get_test_engine());
+        dnn_mem_t mem_fp_s8(mem_fp.md_, dnnl_s8, get_cpu_engine());
         dnn_mem_t mem_dt_s8(mem_dt.md_, dnnl_s8, get_test_engine());
         SAFE(mem_fp_s8.reorder(mem_fp), WARN);
         SAFE(mem_dt_s8.reorder(mem_fp_s8), WARN);
@@ -256,7 +252,7 @@ int fill_dst(
     const auto &c = prb->cfg[DST];
     const int range = c.f_max - c.f_min + 1;
 
-    dnnl::impl::parallel_nd(prb->mb, prb->oc, [&](int64_t mb, int64_t oc) {
+    benchdnn_parallel_nd(prb->mb, prb->oc, [&](int64_t mb, int64_t oc) {
         const int gen = 173 * mb + 179 * oc;
         const bool non_base = flip_coin(gen, c.f_sparsity);
         const float value = non_base ? c.f_min + gen * 1 % range : c.f_base;
@@ -297,6 +293,15 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
             return;
         }
     }
+}
+
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    cmp.set_threshold(prb->cfg[DST].eps);
+
+    // TODO: why so bad filling?
+    const float zero_trust_percent = kind == WEI || kind == BIA ? 90.f : 80.f;
+    cmp.set_zero_trust_percent(zero_trust_percent);
 }
 
 int doit(const prb_t *prb, res_t *res) {
@@ -341,7 +346,7 @@ int doit(const prb_t *prb, res_t *res) {
     SAFE(init_prim_ref(prim_ref, prb), WARN);
 
     const auto &test_engine = get_test_engine();
-    const auto &ref_engine = prim_ref ? get_cpu_engine() : get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
     dnn_mem_t src_dt(src_md, test_engine);
     dnn_mem_t wei_dt(wei_md, test_engine);
@@ -393,7 +398,7 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_ATTR_OUTPUT_SCALES, scales);
         args.set(binary_po_args, binary_po_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_SRC, src_fp);
@@ -402,12 +407,9 @@ int doit(const prb_t *prb, res_t *res) {
             ref_args.set(DNNL_ARG_DST, dst_fp);
             ref_args.set(binary_po_args, binary_po_fp);
             ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
-            TIME_REF(compute_ref_fwd(prb, prim_ref, ref_args));
-            compare::compare_t cmp;
-            cmp.set_threshold(prb->cfg[DST].eps);
-            cmp.set_data_kind(DST);
-            cmp.set_zero_trust_percent(80.f); // TODO: why so bad filling?
-            SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+
+            check_correctness(
+                    prb, {DST}, args, ref_args, setup_cmp, res, prim_ref);
         }
     } else if (prb->dir == BWD_D) {
         args.set(DNNL_ARG_DIFF_DST, dst_dt);
@@ -415,19 +417,16 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_DIFF_SRC, src_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_DIFF_SRC, src_fp);
             ref_args.set(DNNL_ARG_WEIGHTS, wei_fp);
             ref_args.set(DNNL_ARG_DIFF_DST, dst_fp);
             ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
-            TIME_REF(compute_ref_bwd_d(prb, prim_ref, ref_args));
-            compare::compare_t cmp;
-            cmp.set_threshold(prb->cfg[SRC].eps);
-            cmp.set_data_kind(SRC);
-            cmp.set_zero_trust_percent(80.f); // TODO: why so bad filling?
-            SAFE(cmp.compare(src_fp, src_dt, prb->attr, res), WARN);
+
+            check_correctness(
+                    prb, {SRC}, args, ref_args, setup_cmp, res, prim_ref);
         }
     } else if (prb->dir & FLAG_BWD && prb->dir & FLAG_WEI) {
         args.set(DNNL_ARG_SRC, src_dt);
@@ -436,7 +435,7 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_DIFF_BIAS, bia_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
             ref_args.set(DNNL_ARG_SRC, src_fp);
@@ -444,18 +443,9 @@ int doit(const prb_t *prb, res_t *res) {
             ref_args.set(DNNL_ARG_DIFF_DST, dst_fp);
             ref_args.set(DNNL_ARG_DIFF_BIAS, bia_fp);
             ref_args.set(DNNL_ARG_SCRATCHPAD, scratchpad_fp);
-            TIME_REF(compute_ref_bwd_w(prb, prim_ref, ref_args));
-            compare::compare_t cmp;
-            cmp.set_threshold(prb->cfg[WEI].eps);
-            cmp.set_data_kind(WEI);
-            cmp.set_zero_trust_percent(90.f); // TODO: why so bad filling?
-            SAFE(cmp.compare(wei_fp, wei_dt, prb->attr, res), WARN);
-            if (prb->dir & FLAG_BIA) {
-                cmp.set_threshold(prb->cfg[BIA].eps);
-                cmp.set_data_kind(BIA);
-                cmp.set_zero_trust_percent(90.f); // TODO: why so bad filling?
-                SAFE(cmp.compare(bia_fp, bia_dt, prb->attr, res), WARN);
-            }
+
+            check_correctness(
+                    prb, {WEI, BIA}, args, ref_args, setup_cmp, res, prim_ref);
         }
     }
 

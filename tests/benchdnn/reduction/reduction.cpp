@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,11 +19,10 @@
 #include <random>
 #include <sstream>
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "reduction/reduction.hpp"
@@ -33,15 +32,11 @@ namespace reduction {
 int init_pd(dnnl_engine_t engine, const prb_t *prb, dnnl_primitive_desc_t &rpd,
         res_t *res, dir_t dir, const_dnnl_primitive_desc_t hint) {
     dnnl_reduction_desc_t rd;
-    dnnl_memory_desc_t src_desc, dst_desc;
 
-    SAFE(init_md(&src_desc, prb->ndims, prb->vdims[0].data(), prb->sdt,
-                 prb->stag),
-            WARN);
-
-    SAFE(init_md(&dst_desc, prb->ndims, prb->vdims[1].data(), prb->ddt,
-                 prb->dtag),
-            WARN);
+    auto src_desc = dnn_mem_t::init_md(
+            prb->ndims, prb->vdims[0].data(), prb->sdt, prb->stag);
+    auto dst_desc = dnn_mem_t::init_md(
+            prb->ndims, prb->vdims[1].data(), prb->ddt, prb->dtag);
 
     DNN_SAFE(dnnl_reduction_desc_init(&rd, alg2alg_kind(prb->alg), &src_desc,
                      &dst_desc, prb->p, prb->eps),
@@ -97,7 +92,7 @@ int fill_mem(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
     const int64_t n_chunks = 16;
     const int64_t chunk_size = div_up(nelems, n_chunks);
 
-    dnnl::impl::parallel_nd(n_chunks, [&](int64_t idx_chunk) {
+    benchdnn_parallel_nd(n_chunks, [&](int64_t idx_chunk) {
         const int64_t idx_start = idx_chunk * chunk_size;
         const int64_t idx_end = MIN2(idx_start + chunk_size, nelems);
 
@@ -173,6 +168,14 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    // `5` is a temporary magic const for GPU to pass norm algs.
+    // TODO: consider change the filling with power-of-two values for better
+    // answer precision.
+    cmp.set_threshold(5 * epsilon_dt(prb->ddt));
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -200,14 +203,15 @@ int doit(const prb_t *prb, res_t *res) {
     const auto abx_tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
     const auto &src_md = q(DNNL_ARG_SRC);
-    dnn_mem_t src_fp(src_md, fp_dt, abx_tag, test_engine);
+    dnn_mem_t src_fp(src_md, fp_dt, abx_tag, ref_engine);
     dnn_mem_t src_dt(src_md, test_engine);
     SAFE(fill_src(prb, src_dt, src_fp), WARN);
 
     const auto &dst_md = q(DNNL_ARG_DST);
-    dnn_mem_t dst_fp(dst_md, fp_dt, abx_tag, test_engine);
+    dnn_mem_t dst_fp(dst_md, fp_dt, abx_tag, ref_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
     if (prb->attr.post_ops.find(attr_t::post_ops_t::kind_t::SUM) >= 0)
         SAFE(fill_dst(prb, dst_dt, dst_fp), WARN);
@@ -216,24 +220,23 @@ int doit(const prb_t *prb, res_t *res) {
     std::vector<dnn_mem_t> binary_po_fp, binary_po_dt;
     std::vector<int> binary_po_args;
     SAFE(binary::setup_binary_po(const_pd, binary_po_args, binary_po_dt,
-                 binary_po_fp, test_engine, binary_po_only_positive_vals),
+                 binary_po_fp, binary_po_only_positive_vals),
             WARN);
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC, src_dt);
     args.set(DNNL_ARG_DST, dst_dt);
     args.set(binary_po_args, binary_po_dt);
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref(prb, src_fp, binary_po_fp, dst_fp));
-        compare::compare_t cmp;
-        // `5` is a temporary magic const for GPU to pass norm algs.
-        // TODO: consider change the filling with power-of-two values for better
-        // answer precision.
-        cmp.set_threshold(5 * epsilon_dt(prb->ddt));
-        SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+        ref_args.set(DNNL_ARG_SRC, src_fp);
+        ref_args.set(DNNL_ARG_DST, dst_fp);
+        ref_args.set(binary_po_args, binary_po_fp);
+
+        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
     }
 
     return measure_perf(res, prim, args);

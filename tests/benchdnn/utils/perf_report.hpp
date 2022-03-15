@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ struct base_perf_report_t {
     virtual double ops() const { return 0.; }
     virtual const attr_t *attr() const { return nullptr; }
     virtual const int *axis() const { return nullptr; }
-    virtual const char *name() const { return nullptr; }
+    virtual const std::string *name() const { return nullptr; }
     virtual const int64_t *group() const { return nullptr; }
     virtual const dir_t *dir() const { return nullptr; }
     virtual const dnnl_data_type_t *dt() const { return nullptr; }
@@ -56,7 +56,7 @@ struct base_perf_report_t {
     virtual const int64_t *user_mb() const { return nullptr; }
 
     /* designed to be overloaded in reorder only to match verbose output */
-    virtual void dump_engine(std::ostream &s) const { s << engine_tgt_kind; }
+    virtual void dump_engine(std::ostream &s) const;
 
     /* primitive-specific properties (but with common interface) */
     virtual void dump_alg(std::ostream &) const { SAFE_V(FAIL); }

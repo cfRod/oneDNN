@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,13 +19,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "dnnl.h"
+#include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "prelu/prelu.hpp"
 
@@ -39,7 +38,7 @@ int fill_data(data_kind_t kind, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const int64_t n_chunks = 16;
     const int64_t chunk_size = div_up(nelems, n_chunks);
 
-    dnnl::impl::parallel_nd(n_chunks, [&](int64_t idx_chunk) {
+    benchdnn_parallel_nd(n_chunks, [&](int64_t idx_chunk) {
         int64_t idx_start = idx_chunk * chunk_size;
         int64_t idx_end = MIN2(idx_start + chunk_size, nelems);
         // Note 1: we use a different seed for each chunk to avoid
@@ -88,8 +87,7 @@ int fill_data(data_kind_t kind, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
 }
 
 int setup_prelu_po(const_dnnl_primitive_desc_t pd, std::vector<int> &args,
-        std::vector<dnn_mem_t> &ref_mem, std::vector<dnn_mem_t> &prim_mem,
-        const dnnl_engine_t &ref_engine) {
+        std::vector<dnn_mem_t> &ref_mem, std::vector<dnn_mem_t> &prim_mem) {
     const_dnnl_primitive_attr_t const_attr;
     DNN_SAFE(dnnl_primitive_desc_get_attr(pd, &const_attr), WARN);
 
@@ -120,7 +118,7 @@ int setup_prelu_po(const_dnnl_primitive_desc_t pd, std::vector<int> &args,
 
         // Following call can not be executed if po_md has runtime dimension due
         // to undefined size.
-        ref_mem.emplace_back(ndims, dims, dnnl_f32, tag::abx, ref_engine);
+        ref_mem.emplace_back(ndims, dims, dnnl_f32, tag::abx, get_cpu_engine());
         prim_mem.emplace_back(
                 ndims, dims, dnnl_f32, tag::axb, get_test_engine());
         args.push_back(DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_WEIGHTS);
@@ -133,17 +131,14 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &ppd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
     dnnl_prelu_desc_t pd;
-    dnnl_memory_desc_t data_d, weights_d;
 
     const auto &src_dims = prb->vdims[0];
     const auto &weight_dims = prb->vdims[1];
 
-    SAFE(init_md(&data_d, prb->ndims, src_dims.data(), prb->sdt[0],
-                 prb->stag[0]),
-            CRIT);
-    SAFE(init_md(&weights_d, prb->ndims, weight_dims.data(), prb->sdt[1],
-                 prb->stag[1]),
-            CRIT);
+    auto data_d = dnn_mem_t::init_md(
+            prb->ndims, src_dims.data(), prb->sdt[0], prb->stag[0]);
+    auto weights_d = dnn_mem_t::init_md(
+            prb->ndims, weight_dims.data(), prb->sdt[1], prb->stag[1]);
 
     if (prb->dir & FLAG_FWD) {
         auto prop = prb->dir & FLAG_INF ? dnnl_forward_inference
@@ -151,13 +146,10 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         DNN_SAFE(dnnl_prelu_forward_desc_init(&pd, prop, &data_d, &weights_d),
                 WARN);
     } else {
-        dnnl_memory_desc_t diff_data_d, diff_weights_d;
-        SAFE(init_md(&diff_data_d, prb->ndims, src_dims.data(), prb->sdt[0],
-                     prb->stag[0]),
-                CRIT);
-        SAFE(init_md(&diff_weights_d, prb->ndims, weight_dims.data(),
-                     prb->sdt[1], prb->stag[1]),
-                CRIT);
+        auto diff_data_d = dnn_mem_t::init_md(
+                prb->ndims, src_dims.data(), prb->sdt[0], prb->stag[0]);
+        auto diff_weights_d = dnn_mem_t::init_md(
+                prb->ndims, weight_dims.data(), prb->sdt[1], prb->stag[1]);
 
         DNN_SAFE(dnnl_prelu_backward_desc_init(&pd, &data_d, &weights_d,
                          &diff_data_d, &diff_weights_d),
@@ -192,6 +184,17 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    const auto trh_dt = kind == WEI ? prb->sdt[1] : prb->sdt[0];
+    cmp.set_threshold(2 * epsilon_dt(trh_dt));
+
+    // Weights are very sparse, no sense to test for trust, otherwise filling
+    // is specific to cover half non-zeros only.
+    const float zero_trust_percent = kind == WEI ? 99.f : 50.f;
+    cmp.set_zero_trust_percent(zero_trust_percent);
+}
+
 int doit(const prb_t *prb, res_t *res) {
     if (bench_mode == LIST) return res->state = LISTED, OK;
 
@@ -219,9 +222,10 @@ int doit(const prb_t *prb, res_t *res) {
     const auto &weight_md = q(DNNL_ARG_WEIGHTS);
     const auto &scratchpad_md = q(DNNL_ARG_SCRATCHPAD);
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(data_md, dnnl_f32, tag::abx, test_engine);
-    dnn_mem_t weights_fp(weight_md, dnnl_f32, tag::abx, test_engine);
+    dnn_mem_t src_fp(data_md, dnnl_f32, tag::abx, ref_engine);
+    dnn_mem_t weights_fp(weight_md, dnnl_f32, tag::abx, ref_engine);
 
     dnn_mem_t src_dt(data_md, test_engine);
     dnn_mem_t weights_dt(weight_md, test_engine);
@@ -230,7 +234,8 @@ int doit(const prb_t *prb, res_t *res) {
     SAFE(fill_data(SRC, src_dt, src_fp), WARN);
     SAFE(fill_data(WEI, weights_dt, weights_fp), WARN);
 
-    args_t args;
+    args_t args, ref_args;
+
     args.set(DNNL_ARG_SRC, src_dt);
     args.set(DNNL_ARG_WEIGHTS, weights_dt);
     args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
@@ -239,27 +244,27 @@ int doit(const prb_t *prb, res_t *res) {
             d_weights_dt;
 
     if (prb->dir & FLAG_FWD) {
-        dnn_mem_t dst_fp(data_md, dnnl_f32, tag::abx, test_engine);
+        dnn_mem_t dst_fp(data_md, dnnl_f32, tag::abx, ref_engine);
         dst_dt = dnn_mem_t(data_md, test_engine);
 
         args.set(DNNL_ARG_DST, dst_dt);
-        SAFE(execute_and_wait(prim, args), WARN);
+
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_fwd(prb, src_fp, weights_fp, dst_fp));
-            compare::compare_t cmp;
-            cmp.set_threshold(2 * epsilon_dt(prb->sdt[0]));
-            cmp.set_zero_trust_percent(50.f); // Due to filling
-            cmp.set_data_kind(DST);
-            SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_WEIGHTS, weights_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+
+            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
         }
     } else {
         const auto &d_data_md = q(DNNL_ARG_DIFF_DST);
         const auto &d_weights_md = q(DNNL_ARG_DIFF_WEIGHTS);
 
-        dnn_mem_t d_src_fp(d_data_md, dnnl_f32, tag::abx, test_engine);
-        dnn_mem_t d_weights_fp(d_weights_md, dnnl_f32, tag::abx, test_engine);
-        dnn_mem_t d_dst_fp(d_data_md, dnnl_f32, tag::abx, test_engine);
+        dnn_mem_t d_src_fp(d_data_md, dnnl_f32, tag::abx, ref_engine);
+        dnn_mem_t d_weights_fp(d_weights_md, dnnl_f32, tag::abx, ref_engine);
+        dnn_mem_t d_dst_fp(d_data_md, dnnl_f32, tag::abx, ref_engine);
 
         d_src_dt = dnn_mem_t(d_data_md, test_engine);
         d_weights_dt = dnn_mem_t(d_weights_md, test_engine);
@@ -270,25 +275,17 @@ int doit(const prb_t *prb, res_t *res) {
         args.set(DNNL_ARG_DIFF_DST, d_dst_dt);
         args.set(DNNL_ARG_DIFF_SRC, d_src_dt);
         args.set(DNNL_ARG_DIFF_WEIGHTS, d_weights_dt);
-        SAFE(execute_and_wait(prim, args), WARN);
+
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_bwd(
-                    prb, src_fp, weights_fp, d_src_fp, d_dst_fp, d_weights_fp));
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_WEIGHTS, weights_fp);
+            ref_args.set(DNNL_ARG_DIFF_DST, d_dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, d_src_fp);
+            ref_args.set(DNNL_ARG_DIFF_WEIGHTS, d_weights_fp);
 
-            compare::compare_t cmp_src;
-            cmp_src.set_threshold(2 * epsilon_dt(prb->sdt[0]));
-            cmp_src.set_zero_trust_percent(50.f); // Due to filling
-            cmp_src.set_data_kind(SRC);
-            SAFE(cmp_src.compare(d_src_fp, d_src_dt, prb->attr, res), WARN);
-
-            compare::compare_t cmp_wei;
-            cmp_wei.set_threshold(2 * epsilon_dt(prb->sdt[1]));
-            // Weights are very sparse, no sense to test for trust.
-            cmp_wei.set_zero_trust_percent(100.f);
-            cmp_wei.set_data_kind(WEI);
-            SAFE(cmp_wei.compare(d_weights_fp, d_weights_dt, prb->attr, res),
-                    WARN);
+            check_correctness(prb, {SRC, WEI}, args, ref_args, setup_cmp, res);
         }
     }
 

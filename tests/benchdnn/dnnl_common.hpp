@@ -34,6 +34,8 @@ int check_primitive_cache(dnnl_primitive_t p);
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_debug.hpp"
+#include "dnnl_memory.hpp"
+#include "utils/compare.hpp"
 #include "utils/dims.hpp"
 
 #define for_ for
@@ -105,16 +107,6 @@ struct prec_traits<dnnl_u8> {
         CASE(dnnl_u8); \
         default: assert(!"bad data_type"); \
     }
-
-inline size_t sizeof_dt(dnnl_data_type_t dt) {
-#define CASE(dt) \
-    case dt: return sizeof(typename prec_traits<dt>::type);
-
-    CASE_ALL(dt);
-
-#undef CASE
-    return 0;
-}
 
 /* std::numeric_limits::digits functionality */
 inline int digits_dt(dnnl_data_type_t dt) {
@@ -227,8 +219,6 @@ inline const char *query_impl_info(const_dnnl_primitive_desc_t pd) {
     dnnl_primitive_desc_query(pd, dnnl_query_impl_info_str, 0, &str);
     return str;
 }
-
-struct dnn_mem_t;
 
 struct args_t {
     args_t &set(int arg, const dnn_mem_t &mem);
@@ -440,13 +430,104 @@ int init_prim(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &user_prim,
     return OK;
 }
 
+// `check_correctness` function is designed to be called from every driver where
+// correctness validation is needed. It takes:
+// * A pointer to a `prb_t` problem.
+// * A vector of kinds to compare, to validate several outputs, if applicable.
+// * Backend arguments to compare the output.
+// * Driver's reference memory arguments to compute the reference path, then
+//   setup a compare object, and, finally, compare the output.
+// * A reference to function that sets up the compare object, see description
+//   below.
+// * A pointer to a `res_t` structure to update validation status.
+// * An optional pointer to CPU primitive for speeding up reference path
+//   computation on GPU.
+//
+// The function doesn't return status since we rely on `res` to contain all
+// necessary information about validation results.
+//
+// The function performs several validation steps:
+// * Checks that padded area of all memories are properly zeroed.
+// * Checks that GPU backend haven't modified out-of-boundary memory regions.
+// * Executes driver's reference path, using the problem, driver reference
+//   arguments, and CPU primitive for GPU backend, if available.
+// * For each kind to validate it:
+//   - Creates and sets up the compare object. Setting is done with
+//     `setup_cmp_func`.
+//   - Finds correspondent memory arguments from backend and reference and
+//     compares them.
+//   - Result of comparison is saved into `res` object.
+//
+// `setup_cmp_func` is a function that supposed to be defined in every driver's
+// namespace. Its interface is:
+// `void (compare::compare_t &, const prb_t *, data_kind_t, const args_t &);`
+// It takes:
+// * A reference to a `compare_t` object which the function modifies based on
+//   driver's needs.
+// * A pointer to a `prb_t` problem.
+// * `data_kind` value to help to setup threshold depending on output argument.
+// * Driver's reference memory arguments since some drivers can't validate
+//   certain scenarios for sure without additional memory arguments.
+// Returns nothing since the object is modified by reference due to lifetime of
+// the compare object is controlled by `check_correctness`.
+//
+// Note: a dedicated non-templated type for `setup_cmp_func_t` could be used but
+// since it relies on a `prb_t` type which is individual for each driver,
+// it is'nt possible without a template.
+template <typename setup_cmp_func_t, typename prb_t>
+void check_correctness(const prb_t *prb, const std::vector<data_kind_t> &kinds,
+        const args_t &args, const args_t &ref_args,
+        const setup_cmp_func_t &setup_cmp_func, res_t *res,
+        dnnl_primitive_t prim_ref = nullptr) {
+
+    for (int i = 0; i < args.size(); ++i) {
+        check_zero_padding(args.dnn_mem(i), args.arg(i), res);
+        check_buffer_overwrite(args.dnn_mem(i), args.arg(i), res);
+    }
+
+    TIME_REF(compute_ref(prb, ref_args, prim_ref));
+
+    for (const auto &kind : kinds) {
+        compare::compare_t cmp;
+        cmp.set_data_kind(kind);
+        setup_cmp_func(cmp, prb, kind, ref_args);
+
+        int arg = 0;
+        switch (kind) {
+            case DST: arg = DNNL_ARG_DST; break;
+            case SRC: arg = DNNL_ARG_DIFF_SRC; break;
+            case WEI: arg = DNNL_ARG_DIFF_WEIGHTS; break;
+            case BIA: arg = DNNL_ARG_DIFF_BIAS; break;
+            case MEAN: arg = DNNL_ARG_MEAN; break;
+            case VAR: arg = DNNL_ARG_VARIANCE; break;
+            case SS: arg = DNNL_ARG_DIFF_SCALE_SHIFT; break;
+            case SC: arg = DNNL_ARG_DIFF_SCALE; break;
+            case SH: arg = DNNL_ARG_DIFF_SHIFT; break;
+            case DST_ITER: arg = DNNL_ARG_DST_ITER; break;
+            case DST_ITER_C: arg = DNNL_ARG_DST_ITER_C; break;
+            case AUGRU_ATTENTION: arg = DNNL_ARG_DIFF_AUGRU_ATTENTION; break;
+            case SRC_ITER: arg = DNNL_ARG_DIFF_SRC_ITER; break;
+            case SRC_ITER_C: arg = DNNL_ARG_DIFF_SRC_ITER_C; break;
+            case WEI_ITER: arg = DNNL_ARG_DIFF_WEIGHTS_ITER; break;
+            case WEI_PEEPHOLE: arg = DNNL_ARG_DIFF_WEIGHTS_PEEPHOLE; break;
+            case WEI_PROJECTION: arg = DNNL_ARG_DIFF_WEIGHTS_PROJECTION; break;
+            default: assert(!"unsupported kind"); SAFE_V(FAIL);
+        }
+        const auto &mem_dt = args.find(arg);
+        const auto &mem_fp = ref_args.find(arg);
+
+        cmp.compare(mem_fp, mem_dt, prb->attr, res);
+    }
+}
+
 typedef std::function<dnnl_status_t(
         const dnnl_stream_t &, const std::vector<dnnl_exec_arg_t> &)>
         perf_function_t;
 
 int execute_and_wait(perf_function_t &exec_func, const dnnl_engine_t &engine,
-        const args_t &args);
-int execute_and_wait(dnnl_primitive_t prim, const args_t &args);
+        const args_t &args, res_t *res = nullptr);
+int execute_and_wait(
+        dnnl_primitive_t prim, const args_t &args, res_t *res = nullptr);
 
 int measure_perf(res_t *res, perf_function_t &perf_func, args_t &args);
 int measure_perf(res_t *res, dnnl_primitive_t prim, args_t &args);
@@ -484,9 +565,6 @@ inline bool is_nvidia_eltwise_ok(
     return is_nvidia_eltwise_ok(dir, e.kind, e.eltwise.alpha);
 }
 
-int init_md(dnnl_memory_desc_t *md, int ndims, const dnnl_dims_t dims,
-        dnnl_data_type_t data_type, const std::string &tag,
-        const dims_t &strides_ = {});
 int check_mem_size(const dnnl_memory_desc_t &md);
 int check_mem_size(const_dnnl_primitive_desc_t const_pd);
 

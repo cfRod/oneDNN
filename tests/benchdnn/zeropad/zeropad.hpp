@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,19 +17,17 @@
 #ifndef ZEROPAD_HPP
 #define ZEROPAD_HPP
 
-#include <iostream>
-
-#include "dnnl.h"
+#include "oneapi/dnnl/dnnl.h"
 
 #include "common.hpp"
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace zeropad {
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -42,12 +40,10 @@ struct settings_t {
     std::vector<dnnl_data_type_t> dt {dnnl_f32};
     std::vector<std::string> tag {tag::abx};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%dt%,%tag%,%DESC%,%-time%,%"
-              "0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%prb%,%dt%,%tag%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dt%,%tag%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -75,6 +71,7 @@ struct perf_report_t : public base_perf_report_t {
 
     void dump_desc_csv(std::ostream &s) const override { dump_desc(s); }
 
+    const std::string *name() const override { return &p_->name; }
     const dnnl_data_type_t *dt() const override { return &p_->dt; }
     const std::string *tag() const override { return &tag_; }
 

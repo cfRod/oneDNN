@@ -434,6 +434,7 @@ status_t conv_config_t::init_bwd_w(convolution_pd_t *conv_pd) {
 
     mb_unroll = mb_thr_blk / mb_blk;
     ow_unroll = (ow_blk > 1 && is_dp_fma()) ? ow_thr_blk / ow_blk : 1;
+    if (ow_unroll > 8) ow_unroll = 1;
 
     b_blk = g_tg_blk;
     m_tg_blk = ic_tg_blk * kw_tg_blk;
@@ -527,7 +528,7 @@ void conv_config_t::init_data_tags(convolution_pd_t *conv_pd,
     // Set blocks for source layout.
     int src_n_blk = 1;
     int src_c_blk = 1;
-    if (is_small_ic() && !is_dw) {
+    if (is_small_ic() && !is_dw && !is_bwd_d) {
         if (is_dp_fma()) {
             src_c_blk = 4 / src_type_size;
             src_n_blk = pick_block(mb, 8);
@@ -560,6 +561,9 @@ void conv_config_t::init_data_tags(convolution_pd_t *conv_pd,
         if (src_c_blk / 2 > ic) src_c_blk = 1;
         if (dst_c_blk / 2 > oc) dst_c_blk = 1;
     }
+
+    if (is_fwd && vec_size < dst_c_blk) dst_c_blk = 1;
+    if (is_bwd_d && vec_size < src_c_blk) src_c_blk = 1;
 
     if (src_c_blk == 1) src_n_blk = 1;
     if (dst_c_blk == 1) dst_n_blk = 1;

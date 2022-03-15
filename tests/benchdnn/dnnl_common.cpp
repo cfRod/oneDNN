@@ -15,7 +15,6 @@
 *******************************************************************************/
 
 #include <algorithm> // for std::reverse and std::copy
-#include <cctype> // for std::isdigit
 #include <functional> // for std::bind and std::placeholders
 #include <list>
 #include <string> // for std::string
@@ -284,22 +283,17 @@ void execute_map_args(const args_t &args) {
 }
 
 int execute_and_wait(perf_function_t &exec_func, const dnnl_engine_t &engine,
-        const args_t &args) {
+        const args_t &args, res_t *res) {
     stream_t stream(engine);
     std::vector<dnnl_exec_arg_t> dnnl_args;
+
     execute_unmap_args(args, dnnl_args);
 
     DNN_SAFE(exec_func(stream, dnnl_args), CRIT);
     DNN_SAFE(dnnl_stream_wait(stream), CRIT);
+    if (res) res->state = EXECUTED;
 
     execute_map_args(args);
-
-    if (is_bench_mode(CORR)) {
-        for (int i = 0; i < args.size(); ++i) {
-            SAFE(check_zero_padding(args.dnn_mem(i), args.arg(i)), WARN);
-            SAFE(check_buffer_overwrite(args.dnn_mem(i), args.arg(i)), WARN);
-        }
-    }
 
     return OK;
 }
@@ -311,7 +305,7 @@ dnnl_status_t primitive_executor(dnnl_primitive_t prim,
             prim, stream, (int)dnnl_args.size(), dnnl_args.data());
 }
 
-int execute_and_wait(dnnl_primitive_t prim, const args_t &args) {
+int execute_and_wait(dnnl_primitive_t prim, const args_t &args, res_t *res) {
     perf_function_t exec_func = std::bind(&primitive_executor, prim,
             std::placeholders::_1, std::placeholders::_2);
 
@@ -323,7 +317,7 @@ int execute_and_wait(dnnl_primitive_t prim, const args_t &args) {
     DNN_SAFE(
             dnnl_primitive_desc_query(pd, dnnl_query_engine, 0, &engine), CRIT);
 
-    return execute_and_wait(exec_func, engine, args);
+    return execute_and_wait(exec_func, engine, args, res);
 }
 
 inline bool should_stop(const timer::timer_t &t) {
@@ -461,7 +455,7 @@ std::vector<float> prepare_po_vals(const dnn_mem_t &dst_m, const args_t &args,
 bool check_md_consistency_with_tag(
         const dnnl_memory_desc_t &md, const std::string &tag) {
     dnnl_memory_desc_t md_new_tag;
-    SAFE(init_md(&md_new_tag, md.ndims, md.dims, md.data_type, tag), CRIT);
+    md_new_tag = dnn_mem_t::init_md(md.ndims, md.dims, md.data_type, tag);
     return dnnl_memory_desc_equal(&md_new_tag, &md);
 }
 
@@ -554,7 +548,8 @@ void check_sum_post_ops(
                 // Sum must have data type with the same size like dst on both
                 if (dst_dt != dnnl_data_type_undef
                         && sum_dt != dnnl_data_type_undef
-                        && sizeof_dt(dst_dt) != sizeof_dt(e.sum.dt)) {
+                        && dnnl_data_type_size(dst_dt)
+                                != dnnl_data_type_size(e.sum.dt)) {
                     res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
                     return;
                 }
@@ -646,102 +641,6 @@ bool is_nvidia_eltwise_ok(
         // case pk_t::RELU_DST: return alpha == 0.f;
         default: return false;
     };
-}
-
-int init_md(dnnl_memory_desc_t *md, int ndims, const dnnl_dims_t dims,
-        dnnl_data_type_t data_type, const std::string &tag_,
-        const dims_t &strides_) {
-    const bool use_strides = !strides_.empty();
-    // Ignore tag_ in case strides_ are explicitly provided
-    if (use_strides) {
-        std::vector<dnnl_dim_t> strides(strides_);
-        DNN_SAFE(dnnl_memory_desc_init_by_strides(
-                         md, ndims, dims, data_type, strides.data()),
-                CRIT);
-        return OK;
-    }
-    auto tag = normalize_tag(tag_, ndims);
-    if (tag == tag::undef || tag == tag::any || ndims == 0) {
-        dnnl_format_tag_t enum_tag = (tag == tag::undef || ndims == 0)
-                ? dnnl_format_tag_undef
-                : dnnl_format_tag_any;
-        DNN_SAFE(dnnl_memory_desc_init_by_tag(
-                         md, ndims, dims, data_type, enum_tag),
-                CRIT);
-        return OK;
-    }
-
-    // Copy to temporary to handle dims == md->dims case.
-    dnnl_dims_t tmp_dims;
-    std::copy(dims, dims + ndims, tmp_dims);
-
-    *md = dnnl_memory_desc_t();
-    md->ndims = ndims;
-    if (ndims < 0 || ndims > DNNL_MAX_NDIMS) return FAIL;
-
-    std::copy(tmp_dims, tmp_dims + ndims, md->dims);
-    md->data_type = data_type;
-    md->format_kind = dnnl_blocked;
-
-    // Parse dimensions and their block sizes starting from the innermost one.
-    std::vector<std::pair<int, int>> dim_blocks;
-    int pos = (int)tag.size() - 1;
-    int ndims_from_tag = -1;
-    while (pos >= 0) {
-        int pos0 = pos;
-
-        --pos;
-        while (pos >= 0 && std::isdigit(tag[pos]))
-            pos--;
-
-        int dim_idx = std::tolower(tag[pos0]) - 'a';
-        if (dim_idx >= ndims) return FAIL;
-        ndims_from_tag = MAX2(dim_idx + 1, ndims_from_tag);
-        int block_str_len = pos0 - pos - 1;
-        int block = (block_str_len == 0)
-                ? 1
-                : std::stoi(tag.substr(pos + 1, block_str_len));
-        dim_blocks.emplace_back(dim_idx, block);
-    }
-    if (ndims_from_tag != ndims) return FAIL;
-
-    auto &blk = md->format_desc.blocking;
-
-    // Compute strides and fill inner block sizes/indices.
-    dnnl_dim_t stride = 1;
-    dnnl_dims_t full_inner_blks;
-    std::fill(full_inner_blks, full_inner_blks + ndims, 1);
-    for (auto &p : dim_blocks) {
-        int dim_idx = p.first;
-        int block = p.second;
-        if (block == 1) {
-            assert(blk.strides[dim_idx] == 0);
-            blk.strides[dim_idx] = stride;
-
-            dnnl_dim_t fib = full_inner_blks[dim_idx];
-            dnnl_dim_t padded_dim = md->dims[dim_idx] == DNNL_RUNTIME_DIM_VAL
-                    ? DNNL_RUNTIME_DIM_VAL
-                    : (md->dims[dim_idx] + fib - 1) / fib * fib;
-            md->padded_dims[dim_idx] = padded_dim;
-            if (padded_dim == DNNL_RUNTIME_DIM_VAL)
-                stride = DNNL_RUNTIME_DIM_VAL;
-            else
-                stride *= (padded_dim / fib);
-        } else {
-            full_inner_blks[dim_idx] *= block;
-            blk.inner_blks[blk.inner_nblks] = block;
-            blk.inner_idxs[blk.inner_nblks] = dim_idx;
-            blk.inner_nblks++;
-            stride *= block;
-        }
-    }
-
-    // Inner block sizes/indices are stored from the outermost to the innermost
-    // so need to reverse them.
-    std::reverse(blk.inner_blks, blk.inner_blks + blk.inner_nblks);
-    std::reverse(blk.inner_idxs, blk.inner_idxs + blk.inner_nblks);
-
-    return OK;
 }
 
 #if defined(_WIN32) && !defined(__GNUC__)
@@ -843,7 +742,8 @@ static size_t get_md_size(const dnnl_memory_desc_t *md,
     // reference memories are always fp32, hence need rescaling factor
     size_t ref_mem_factor = 1;
     if (md->data_type != dnnl_data_type_undef)
-        ref_mem_factor = ::sizeof_dt(dnnl_f32) / ::sizeof_dt(md->data_type);
+        ref_mem_factor = dnnl_data_type_size(dnnl_f32)
+                / dnnl_data_type_size(md->data_type);
     // correctness pass allocates additional plain f32 memory to compare values.
     if (add_ref_out_size && is_bench_mode(CORR)) ref_mem_factor *= 2;
 

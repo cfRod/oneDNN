@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,11 +21,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "binary/binary.hpp"
 #include "resampling/resampling.hpp"
@@ -39,7 +38,7 @@ int fill_dat(const prb_t *prb, data_kind_t kind, dnn_mem_t &mem_dt,
     const int range = 16;
     const int f_min = 0;
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const float gen = ((97 * i) - 19 * kind + 101) % (range + 1);
         const float value = dt == dnnl_f32 || is_integral_dt(dt)
                 ? (f_min + gen) * (1.0f + 4.0f / range)
@@ -66,8 +65,6 @@ int fill_dst(
 static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &rpd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
-    dnnl_memory_desc_t src_d, dst_d;
-
     dnnl_dims_t src_1d_dims = {prb->mb, prb->ic, prb->iw};
     dnnl_dims_t src_2d_dims = {prb->mb, prb->ic, prb->ih, prb->iw};
     dnnl_dims_t src_3d_dims = {prb->mb, prb->ic, prb->id, prb->ih, prb->iw};
@@ -85,9 +82,8 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
     std::string src_tag = (prb->dir & FLAG_FWD) ? prb->tag : tag::any;
     std::string dst_tag = (prb->dir & FLAG_BWD) ? prb->tag : tag::any;
 
-    SAFE(init_md(&src_d, prb->ndims, src_dims, prb->sdt, src_tag), CRIT);
-
-    SAFE(init_md(&dst_d, prb->ndims, dst_dims, prb->ddt, dst_tag), CRIT);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, src_dims, prb->sdt, src_tag);
+    auto dst_d = dnn_mem_t::init_md(prb->ndims, dst_dims, prb->ddt, dst_tag);
 
     dnnl_alg_kind_t alg = alg2alg_kind(prb->alg);
     dnnl_resampling_desc_t rd;
@@ -107,11 +103,10 @@ static int init_pd(dnnl_engine_t engine, const prb_t *prb,
     dnnl_primitive_desc_t hint_fwd_pd_ {};
     dnnl_status_t status = dnnl_success;
     if (prb->dir & FLAG_BWD) {
-        dnnl_memory_desc_t fwd_src_d, fwd_dst_d;
-        SAFE(init_md(&fwd_src_d, prb->ndims, src_dims, prb->sdt, prb->tag),
-                CRIT);
-        SAFE(init_md(&fwd_dst_d, prb->ndims, dst_dims, prb->ddt, tag::any),
-                CRIT);
+        auto fwd_src_d
+                = dnn_mem_t::init_md(prb->ndims, src_dims, prb->sdt, prb->tag);
+        auto fwd_dst_d
+                = dnn_mem_t::init_md(prb->ndims, dst_dims, prb->ddt, tag::any);
 
         dnnl_resampling_desc_t rd_fwd;
         DNN_SAFE(dnnl_resampling_forward_desc_init(&rd_fwd,
@@ -167,37 +162,49 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     }
 }
 
-/* The following issue takes place for integer data types:
- * Sometimes there are differences in the order of operations between
- * the version of the algorithm implemented in the kernel and the reference
- * algorithm. Therefore, this function is especially important if the
- * destination data type is an integer, because when the floating-point
- * type is used to compute the algorithm and if the returned value is very
- * close to x.5, there may be a difference between the output value of
- * reference and the kernel, as one version may round up and the other down.
- * Therefore, we can assume that two values are equal to each other when:
- * - there is a difference in the order of operations,
- * - and the output value of the algorithm is very close to x.5,
- * - and the difference between the output value of reference and expected is 1,
- * - and the output type is an integer type */
-void add_additional_check_to_compare(compare::compare_t &cmp) {
-    using cmp_args_t = compare::compare_t::driver_check_func_args_t;
-    cmp.set_driver_check_function([&](const cmp_args_t &args) -> bool {
-        if (!is_integral_dt(args.dt)) return false;
-        // Check that original value is close to x.5f
-        static constexpr float small_eps = 9e-6;
-        if (fabsf((floorf(args.exp_f32) + 0.5f) - args.exp_f32) >= small_eps)
-            return false;
-        // If it was, check that exp and got values reside on opposite sides of it.
-        if (args.exp == floorf(args.exp_f32))
-            return args.got == ceilf(args.exp_f32);
-        else if (args.exp == ceilf(args.exp_f32))
-            return args.got == floorf(args.exp_f32);
-        else {
-            assert(!"unexpected scenario");
-            return false;
-        }
-    });
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    const auto dt_from = (prb->dir & FLAG_FWD) ? prb->sdt : prb->ddt;
+    const auto dt_to = (prb->dir & FLAG_FWD) ? prb->ddt : prb->sdt;
+    const float linear_trh = epsilon_dt(dt_from) > epsilon_dt(dt_to)
+            ? epsilon_dt(dt_from) // conversion error for dt_to
+            : 7 * epsilon_dt(dt_to); // algorithm calculation error
+    float trh = prb->alg == nearest ? 0.f : linear_trh;
+    if (is_nvidia_gpu()) {
+        // cuDNN precision is different from ref one due to different
+        // computation algorithm used for resampling.
+        trh = prb->ddt == dnnl_f16 ? 4e-2 : 2e-5;
+    }
+    cmp.set_threshold(trh);
+
+    // No sense to test zero trust for upsampling since it produces valid zeros.
+    // TODO: validate this once again.
+    cmp.set_zero_trust_percent(99.f);
+
+    // Resampling on integer data types may result in sporadic order of
+    // operations. This may cause a difference around `x.5` floating-point, and
+    // can be rounded either way to `x` or to `x+1` which can't be fixed by
+    // filling.
+    const auto resampling_add_check
+            = [&](const compare::compare_t::driver_check_func_args_t &args) {
+                  if (!is_integral_dt(args.dt)) return false;
+                  // Check that original value is close to x.5f
+                  static constexpr float small_eps = 9e-6;
+                  if (fabsf((floorf(args.exp_f32) + 0.5f) - args.exp_f32)
+                          >= small_eps)
+                      return false;
+                  // If it was, check that exp and got values reside on opposite
+                  // sides of it.
+                  if (args.exp == floorf(args.exp_f32))
+                      return args.got == ceilf(args.exp_f32);
+                  else if (args.exp == ceilf(args.exp_f32))
+                      return args.got == floorf(args.exp_f32);
+                  else {
+                      assert(!"unexpected scenario");
+                      return false;
+                  }
+              };
+    if (prb->alg == linear) cmp.set_driver_check_function(resampling_add_check);
 }
 
 int doit(const prb_t *prb, res_t *res) {
@@ -233,11 +240,12 @@ int doit(const prb_t *prb, res_t *res) {
     const auto tag = tag::abx;
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
 
-    dnn_mem_t src_fp(src_md, fp, tag, test_engine);
+    dnn_mem_t src_fp(src_md, fp, tag, ref_engine);
     dnn_mem_t src_dt(src_md, test_engine);
 
-    dnn_mem_t dst_fp(dst_md, fp, tag, test_engine);
+    dnn_mem_t dst_fp(dst_md, fp, tag, ref_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
     if (prb->attr.post_ops.find(attr_t::post_ops_t::kind_t::SUM) >= 0)
         SAFE(fill_dst(prb, dst_dt, dst_fp, res), WARN);
@@ -255,72 +263,44 @@ int doit(const prb_t *prb, res_t *res) {
     // between the expected value and the gotten value with this algorithm.
     const bool only_positive_values = prb->alg == linear;
     SAFE(binary::setup_binary_po(const_pd, binary_po_args, binary_po_dt,
-                 binary_po_fp, test_engine, only_positive_values),
+                 binary_po_fp, only_positive_values),
             WARN);
 
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
-    args_t args;
-
-    compare::compare_t cmp;
-    const bool operations_order_can_be_different = prb->alg == linear;
-    if (operations_order_can_be_different) add_additional_check_to_compare(cmp);
+    args_t args, ref_args;
 
     if (prb->dir & FLAG_FWD) {
         SAFE(fill_src(prb, src_dt, src_fp, res), WARN);
+
         args.set(DNNL_ARG_SRC, src_dt);
         args.set(DNNL_ARG_DST, dst_dt);
         args.set(binary_po_args, binary_po_dt);
-
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_fwd(prb, src_fp, dst_fp, binary_po_fp));
-            const float linear_trh = epsilon_dt(prb->sdt) > epsilon_dt(prb->ddt)
-                    ? epsilon_dt(prb->sdt) // conversion error sdt->ddt
-                    : 7 * epsilon_dt(prb->ddt); // algorithm calculation error
-            float trh = prb->alg == nearest ? 0.f : linear_trh;
+            ref_args.set(DNNL_ARG_SRC, src_fp);
+            ref_args.set(DNNL_ARG_DST, dst_fp);
+            ref_args.set(binary_po_args, binary_po_fp);
 
-            if (is_nvidia_gpu()) {
-                // cuDNN precision is different from ref one due to different
-                // computation algorithm used for resampling.
-                trh = prb->ddt == dnnl_f16 ? 4e-2 : 2e-5;
-            }
-
-            cmp.set_threshold(trh);
-            // No sense to test zero trust for upsampling since it produces
-            // valid zeros.
-            // TODO: validate this once again.
-            cmp.set_zero_trust_percent(100.f);
-            SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+            check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
         }
     } else {
         SAFE(fill_dst(prb, dst_dt, dst_fp, res), WARN);
+
         args.set(DNNL_ARG_DIFF_DST, dst_dt);
         args.set(DNNL_ARG_DIFF_SRC, src_dt);
         args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
-        SAFE(execute_and_wait(prim, args), WARN);
+        SAFE(execute_and_wait(prim, args, res), WARN);
 
         if (is_bench_mode(CORR)) {
-            TIME_REF(compute_ref_bwd(prb, src_fp, dst_fp));
-            const float linear_trh = epsilon_dt(prb->ddt) > epsilon_dt(prb->sdt)
-                    ? epsilon_dt(prb->ddt)
-                    : 7 * epsilon_dt(prb->sdt);
-            float trh = prb->alg == nearest ? 0.f : linear_trh;
+            ref_args.set(DNNL_ARG_DIFF_DST, dst_fp);
+            ref_args.set(DNNL_ARG_DIFF_SRC, src_fp);
 
-            // cuDNN precision is different from ref one due to different
-            // computation algorithm used for resampling.
-            if (is_nvidia_gpu()) trh = 2e-5;
-
-            cmp.set_threshold(trh);
-            // No sense to test zero trust for upsampling since it produces
-            // valid zeros.
-            // TODO: validate this once again.
-            cmp.set_zero_trust_percent(100.f);
-            SAFE(cmp.compare(src_fp, src_dt, prb->attr, res), WARN);
+            check_correctness(prb, {SRC}, args, ref_args, setup_cmp, res);
         }
     }
 

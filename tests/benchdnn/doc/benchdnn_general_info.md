@@ -43,20 +43,19 @@ following steps to execute any flow:
    reasonable data.
 5. Execute backend path.
 6. Correctness validation:
+   * Check that padded area, if present, is properly zeroed for each memory.
+   * For GPU: check that the backend didn't write out-of-boundary.
    * Execute reference path.
    * Setup compare object.
-   * Compare outputs of backend and reference.
-   * Check that padded area, if any, is properly zeroed.
-   * Report a test case status and repro line.
+   * Compare outputs of backend and reference and save the status.
 7. Performance validation:
-   * If correctness was requested, proceed if status is "PASSED" or
-     "MISTRUSTED".
    * Execute backend path in a loop until one of selected criterion to stop is
      triggered. Refer to [performance options](knobs_common.md) for details.
-   * Print a performance report output based on selected options and collected
-     statistics during the previous step.
-8. Repeat steps 2-7 until all setups are validated.
-9. Report the summary and return the status.
+8. Report a test case status and repro line.
+   * If performance validation was requested, print a performance report output
+     based on selected options and collected statistics.
+9. Repeat steps 2-7 until all setups are validated.
+10. Report the summary and return the status.
 
 The following modes are supported:
 * Correctness mode: This is the default driver flow. It executes steps above
@@ -73,27 +72,32 @@ The following modes are supported:
 
 ## Problem Statuses
 
-Each problem in **benchdnn** has its status indicating the result of running a
-problem in the correctness mode. Following statuses are supported:
-* `EXECUTED`. It means that a problem was run but did not utilize correctness
-  validation. This reflects that `Run` mode was used.
-* `PASSED`. It means that a problem passed the validation, and a library output
-  coincides with a reference path from the driver.
-* `SKIPPED`. It means that a problem was not run and a brief reason is reported.
-* `LISTED`. It means that a benchdnn problem was created and the reproducer line
-  was reported. A primitive descriptor is not created in this case.
+Each problem in **benchdnn** receives a status reflecting the outcome of the
+problem execution. Following statuses are supported (in order of processing the
+problem):
+* `LISTED`. It means that a driver problem object was created, and the
+  reproducer line might be reported. The execution was stopped before creating
+  any library objects.
+* `SKIPPED`. Same as `LISTED` but the execution was stopped intentionally for
+  the reason given in the short description, e.g. `CASE_NOT_SUPPORTED` or
+  `SKIP_IMPL_HIT`.
+* `UNIMPLEMENTED`. It means that the library does not have an implementation for
+  a requested problem. It is treated as a failure.
+* `EXECUTED`. It means that a problem was run, and the library execution call
+  was successful, but the correctness was not validated.
+* `PASSED`. It means that a problem passed the correctness validation, and the
+  library output matches the driver's reference output.
 * `MISTRUSTED`. It means that the quality of correctness validation is under
   question. This often happens when the ratio of the number of zero values to
   the total number of elements in the output exceeds a certain threshold. One
   possible reason is improper filling of input data for a given driver,
   specific algorithm, or a specific problem. Though the validation may not
   fulfil the purpose, as long as values are same for driver reference and the
-  library outputs, this is not treated as `FAILED` but as `PASSED` with some
-  assumptions.
-* `FAILED`. It means that a problem did not pass the validation, and a library
-  output differs from a reference path from the driver.
-* `UNIMPLEMENTED`. It means that the library does not have an implementation for
-  a requested problem. It is treated as `FAILED`.
+  library outputs, it is not treated as a failure.
+* `FAILED`. It means that a problem did not pass the correctness validation,
+  and the library output differs from the driver's reference output.
+* `UNTESTED`. It means that none of above statuses were assigned, and the
+  execution was aborted at unexpected place. It is treated as a failure.
 
 ## Input Files Naming Convention
 

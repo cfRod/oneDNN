@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,11 +23,10 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#include "tests/test_thread.hpp"
+#include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
-#include "utils/compare.hpp"
 
 #include "sum/sum.hpp"
 
@@ -36,19 +35,16 @@ namespace sum {
 static int init_pd(dnnl_engine_t engine, const prb_t *prb,
         dnnl_primitive_desc_t &spd, res_t *res, dir_t dir,
         const_dnnl_primitive_desc_t hint) {
-    std::vector<dnnl_memory_desc_t> src_d;
-    src_d.resize(prb->n_inputs());
-
-    dnnl_memory_desc_t dst_d;
+    std::vector<dnnl_memory_desc_t> src_d(prb->n_inputs());
 
     for (int i_input = 0; i_input < prb->n_inputs(); ++i_input)
-        SAFE(init_md(&src_d[i_input], prb->ndims, prb->dims.data(),
-                     prb->sdt[i_input], prb->stag[i_input]),
-                CRIT);
+        src_d[i_input] = dnn_mem_t::init_md(prb->ndims, prb->dims.data(),
+                prb->sdt[i_input], prb->stag[i_input]);
 
+    dnnl_memory_desc_t dst_d {};
     if (prb->dtag != tag::undef) {
-        SAFE(init_md(&dst_d, prb->ndims, prb->dims.data(), prb->ddt, prb->dtag),
-                CRIT);
+        dst_d = dnn_mem_t::init_md(
+                prb->ndims, prb->dims.data(), prb->ddt, prb->dtag);
     }
 
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
@@ -89,7 +85,7 @@ int fill_src(
     const int range = 16;
     const int f_min = dt == dnnl_u8 ? 0 : -range / 2;
 
-    dnnl::impl::parallel_nd(nelems, [&](int64_t i) {
+    benchdnn_parallel_nd(nelems, [&](int64_t i) {
         const float gen = ((97 * i) - 17 * input_idx + 101) % range;
         const float value = (dt == dnnl_bf16 || dt == dnnl_f16)
                 ? (f_min + gen) / range
@@ -106,6 +102,11 @@ void check_known_skipped_case(const prb_t *prb, res_t *res) {
     std::vector<dnnl_data_type_t> dts = prb->sdt;
     dts.push_back(prb->ddt);
     check_known_skipped_case_common(dts, FWD_D, res);
+}
+
+void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
+        const args_t &ref_args) {
+    cmp.set_threshold(epsilon_dt(prb->ddt) * prb->n_inputs());
 }
 
 int doit(const prb_t *prb, res_t *res) {
@@ -132,14 +133,15 @@ int doit(const prb_t *prb, res_t *res) {
     };
 
     const auto &test_engine = get_test_engine();
+    const auto &ref_engine = get_cpu_engine();
     const auto &dst_md = q(DNNL_ARG_DST);
     const auto &scratchpad_md = q(DNNL_ARG_SCRATCHPAD);
 
-    dnn_mem_t dst_fp(dst_md, dnnl_f32, tag::abx, test_engine);
+    dnn_mem_t dst_fp(dst_md, dnnl_f32, tag::abx, ref_engine);
     dnn_mem_t dst_dt(dst_md, test_engine);
     dnn_mem_t scratchpad_dt(scratchpad_md, test_engine);
 
-    args_t args;
+    args_t args, ref_args;
     args.set(DNNL_ARG_DST, dst_dt);
     args.set(DNNL_ARG_SCRATCHPAD, scratchpad_dt);
 
@@ -149,19 +151,20 @@ int doit(const prb_t *prb, res_t *res) {
 
     for (int i_input = 0; i_input < prb->n_inputs(); ++i_input) {
         const auto &src_md = q(DNNL_ARG_MULTIPLE_SRC + i_input);
-        src_fp.emplace_back(src_md, dnnl_f32, tag::abx, test_engine);
+        src_fp.emplace_back(src_md, dnnl_f32, tag::abx, ref_engine);
         src_dt.emplace_back(src_md, test_engine);
         SAFE(fill_src(prb, i_input, src_dt[i_input], src_fp[i_input]), WARN);
         args.set(DNNL_ARG_MULTIPLE_SRC + i_input, src_dt[i_input]);
+        if (is_bench_mode(CORR))
+            ref_args.set(DNNL_ARG_MULTIPLE_SRC + i_input, src_fp[i_input]);
     }
 
-    SAFE(execute_and_wait(prim, args), WARN);
+    SAFE(execute_and_wait(prim, args, res), WARN);
 
     if (is_bench_mode(CORR)) {
-        TIME_REF(compute_ref(prb, src_fp, dst_fp));
-        compare::compare_t cmp;
-        cmp.set_threshold(epsilon_dt(dst_md.data_type) * prb->n_inputs());
-        SAFE(cmp.compare(dst_fp, dst_dt, prb->attr, res), WARN);
+        ref_args.set(DNNL_ARG_DST, dst_fp);
+
+        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
     }
 
     return measure_perf(res, prim, args);

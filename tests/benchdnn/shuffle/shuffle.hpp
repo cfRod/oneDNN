@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2021 Intel Corporation
+* Copyright 2018-2022 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,12 +27,12 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_debug.hpp"
-#include "dnnl_memory.hpp"
 #include "utils/perf_report.hpp"
+#include "utils/settings.hpp"
 
 namespace shuffle {
 
-struct settings_t {
+struct settings_t : public base_settings_t {
     settings_t() = default;
 
     // ctor to save certain fields from resetting
@@ -47,15 +47,11 @@ struct settings_t {
     std::vector<std::string> tag {tag::abx};
     std::vector<int64_t> group {1};
     std::vector<int> axis {1};
-    std::vector<dnnl_scratchpad_mode_t> scratchpad_mode {
-            dnnl_scratchpad_mode_library};
 
-    const char *perf_template_csv
-            = "perf,%engine%,%impl%,%dir%,%dt%,%tag%,%group%,%axis%,%DESC%,%-"
-              "time%,%0time%";
-    const char *perf_template_def
-            = "perf,%engine%,%impl%,%prb%,%-time%,%0time%";
-    const char *perf_template = perf_template_def;
+    const char *perf_template_csv() const {
+        static const std::string args = "%dir%,%dt%,%tag%,%group%,%axis%";
+        return perf_template_csv_base(args);
+    }
 
     void reset() { *this = settings_t(perf_template); }
 };
@@ -93,6 +89,7 @@ struct perf_report_t : public base_perf_report_t {
 
     void dump_desc_csv(std::ostream &s) const override { dump_desc(s); }
 
+    const std::string *name() const override { return &p_->name; }
     const int *axis() const override { return &p_->axis; }
     const int64_t *group() const override { return &p_->group; }
     const dir_t *dir() const override { return &p_->dir; }
@@ -110,7 +107,9 @@ inline size_t data_off(const prb_t *prb, int64_t mb, int64_t c, int64_t d,
     return (((mb * dims[1] + c) * dims[2] + d) * dims[3] + h) * dims[4] + w;
 }
 
-void compute_ref(const prb_t *prb, const dnn_mem_t &src, dnn_mem_t &dst);
+void compute_ref(const prb_t *prb, const args_t &args,
+        dnnl_primitive_t prim_ref = nullptr);
+
 int doit(const prb_t *prb, res_t *res);
 int bench(int argc, char **argv);
 } // namespace shuffle
